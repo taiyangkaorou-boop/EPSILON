@@ -144,7 +144,7 @@ ErrorType SplineGenerator<N_DEG, N_DIM>::GetCubicSplineBySampleInterpolation(
           coeff[N_DEG - d] = 0.0;  // 高阶项系数为0（因为是三次样条）
         }
       }
-      cubic_spline(n, d).set_coeff(coeff);
+      cubic_spline(n, i).set_coeff(coeff);
     }
   }
   (*spline) = std::move(cubic_spline);
