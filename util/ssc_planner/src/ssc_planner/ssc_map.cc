@@ -66,6 +66,11 @@ SscMap::SscMap(const SscMap::Config &config) : config_(config) {
   // 膨胀后的障碍物占据栅格 (用于更保守的安全检查)
   p_3d_inflated_grid_ = new common::GridMapND<SscMapDataType, 3>(
       config_.map_size, config_.map_resolution, config_.axis_name);
+
+  /// @brief 初始化风险占据栅格图 —— 大小与原始 binary map 一致，初始值为 0.0f（无风险）
+  /// @note 风险图容量 = s_dim * d_dim * t_dim，与 GridMapND 的平铺布局一致
+  int total_cells = config_.map_size[0] * config_.map_size[1] * config_.map_size[2];
+  p_3d_risk_grid_.resize(total_cells, 0.0f);
 }
 
 /// @brief 重置 SSC 地图: 清空走廊数据, 清空栅格数据, 更新地图原点
@@ -73,6 +78,11 @@ SscMap::SscMap(const SscMap::Config &config) : config_(config) {
 ErrorType SscMap::ResetSscMap(const common::FrenetState &ini_fs) {
   ClearDrivingCorridor();
   ClearGridMap();
+
+  /// @brief 同步清空风险占据图 —— 与 binary map 保持生命周期一致
+  /// @note 每次规划循环开始时，风险图需要与 binary map 同时清零，
+  ///       避免上一帧的风险数据污染当前帧
+  ResetRiskMap();
 
   start_time_ = ini_fs.time_stamp;
   UpdateMapOrigin(ini_fs);
@@ -129,11 +139,23 @@ ErrorType SscMap::ConstructSscMap(
   // 清空两张栅格地图
   p_3d_grid_->clear_data();
   p_3d_inflated_grid_->clear_data();
+  ResetRiskMap();
 
   // 第1步: 填充静态障碍物 (对所有时间层)
   FillStaticPart(obstacle_grids);
   // 第2步: 填充动态障碍物 (按时间层)
   FillDynamicPart(sur_vehicle_trajs_fs);
+
+  /// @brief 第3步（新增）: 概率化填充动态障碍物到风险占据图
+  /// @note 此步骤在原始 binary 填充之后执行，不影响二进制占据图。
+  ///       MVP-0 中 existence_prob = 1.0f，即确定性轨迹镜像。
+  ///       后续 MVP-1 将替换为来自 MOBIL/EUDM 的真实概率值
+  FillDynamicPartProbabilistic(sur_vehicle_trajs_fs);
+
+  /// @brief 第4步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
+  /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
+  const auto risk_stats = ComputeRiskGridStats();
+  PrintRiskGridStatsIfNeeded(risk_stats);
 
   return kSuccess;
 }
@@ -165,6 +187,104 @@ ErrorType SscMap::ClearGridMap() {
 ErrorType SscMap::ClearDrivingCorridor() {
   driving_corridor_vec_.clear();
   return kSuccess;
+}
+
+/// @brief 重置风险占据图 —— 使用 std::fill 将所有栅格值置零
+/// @return kSuccess
+/// @note 时间复杂度 O(N)，N 为栅格总数 (s_dim * d_dim * t_dim)。
+///       std::fill 对 float 数组高度优化，通常被编译器向量化
+ErrorType SscMap::ResetRiskMap() {
+  std::fill(p_3d_risk_grid_.begin(), p_3d_risk_grid_.end(), 0.0f);
+  return kSuccess;
+}
+
+/// @brief 计算风险占据栅格的统计信息 —— 只读操作，不修改任何地图数据
+/// @return RiskGridStats 结构体
+/// @note MVP-1A: 纯调试函数。逐栅格遍历 p_3d_risk_grid_，
+///       按 layer_idx = idx / (w * h) 分层统计非零栅格数和风险值。
+///       sum_risk 使用 double 累加以避免 float 截断误差。
+///       该函数不参与任何规划决策。
+RiskGridStats SscMap::ComputeRiskGridStats() const {
+  RiskGridStats stats;
+
+  /// @brief 风险图总栅格数 —— 直接取自 p_3d_risk_grid_.size()
+  stats.total_cells = p_3d_risk_grid_.size();
+
+  /// @brief 获取三维尺寸: w = s方向栅格数, h = d方向栅格数, t = 时间层数
+  const auto dims_size = p_3d_grid_->dims_size();
+  int w = dims_size[0];  // s 方向栅格数
+  int h = dims_size[1];  // d 方向栅格数
+  int t = dims_size[2];  // t 方向栅格数（时间层数）
+
+  /// @brief 每层非零栅格计数，初始化为 t 个 0
+  if (t > 0) {
+    stats.nonzero_cells_per_layer.resize(static_cast<size_t>(t), 0);
+  }
+
+  /// @brief 异常尺寸或空风险图直接返回空统计，避免调试函数触发除零或越界
+  if (w <= 0 || h <= 0 || t <= 0 || stats.total_cells == 0) {
+    return stats;
+  }
+
+  const size_t layer_cell_num =
+      static_cast<size_t>(w) * static_cast<size_t>(h);
+
+  /// @brief 单次遍历完成所有统计: 非零计数、最大值、总和、分层计数
+  stats.max_risk = 0.0f;
+  stats.sum_risk = 0.0;
+  for (size_t idx = 0; idx < stats.total_cells; ++idx) {
+    RiskMapDataType risk = p_3d_risk_grid_[idx];
+
+    /// @brief 非零判断: risk > 0.0f 视为占据栅格
+    if (risk > 0.0f) {
+      ++stats.nonzero_cells;
+
+      /// @brief 更新最大风险值
+      if (risk > stats.max_risk) {
+        stats.max_risk = risk;
+      }
+
+      /// @brief double 累加风险值，避免 float 截断误差
+      stats.sum_risk += static_cast<double>(risk);
+
+      /// @brief 按 idx / (w * h) 得到当前栅格所在的时间层索引
+      size_t layer_idx = idx / layer_cell_num;
+      if (layer_idx < static_cast<size_t>(t)) {
+        ++stats.nonzero_cells_per_layer[layer_idx];
+      }
+    }
+  }
+
+  /// @brief 统计活跃时间层: 至少有一个非零栅格的时间层
+  stats.active_time_layers = 0;
+  for (size_t layer = 0; layer < static_cast<size_t>(t); ++layer) {
+    if (stats.nonzero_cells_per_layer[layer] > 0) {
+      ++stats.active_time_layers;
+    }
+  }
+
+  return stats;
+}
+
+/// @brief 按需输出风险占据栅格统计日志
+/// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
+/// @note MVP-1A: 使用 LOG(WARNING) 输出，前缀固定为 [Ssc][RiskGridStats]。
+///       输出内容: summary 行（total/nonzero/max/sum/active_layers）
+///       + per-layer 行（每时间层的非零栅格数）。
+///       该函数不触发任何规划逻辑。
+void SscMap::PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const {
+  LOG(WARNING) << "[Ssc][RiskGridStats] total_cells=" << stats.total_cells
+               << " nonzero_cells=" << stats.nonzero_cells
+               << " max_risk=" << stats.max_risk
+               << " sum_risk=" << stats.sum_risk
+               << " active_time_layers=" << stats.active_time_layers
+               << "/" << stats.nonzero_cells_per_layer.size();
+
+  /// @brief 逐层输出非零栅格数，用于验证 risk grid 是否被正确填充到各个时间层
+  for (size_t layer = 0; layer < stats.nonzero_cells_per_layer.size(); ++layer) {
+    LOG(WARNING) << "[Ssc][RiskGridStats] layer[" << layer
+                 << "] nonzero_cells=" << stats.nonzero_cells_per_layer[layer];
+  }
 }
 
 /// @brief 沿初始参考轨迹构建时空走廊 —— 核心算法
@@ -1041,6 +1161,108 @@ ErrorType SscMap::FillMapWithFsVehicleTraj(
                 p_3d_grid_->get_data_ptr() + layer_offset);
     // 多边形填充 (值100 = 占用)
     cv::fillPoly(layer_mat, vv_coord_cv, 100);
+  }
+
+  return kSuccess;
+}
+
+/// @brief 概率化填充动态障碍物 —— 遍历所有周围车辆，逐条写入风险占据图
+/// @param sur_vehicle_trajs_fs 周围车辆在 Frenet 坐标下的预测轨迹集合
+///                              (key=车辆ID, value=该车辆的Frenet轨迹序列)
+/// @return kSuccess
+/// @note 此函数的结构与 FillDynamicPart 完全对称，区别在于调用
+///       FillMapWithFsVehicleTrajProbabilistic 而非 FillMapWithFsVehicleTraj
+ErrorType SscMap::FillDynamicPartProbabilistic(
+    const std::unordered_map<int, vec_E<common::FsVehicle>>& sur_vehicle_trajs_fs) {
+  /// @brief 逐车填充风险占据图 —— 遍历 sur_vehicle_trajs_fs 中的每辆车
+  /// @note 对每辆周围车辆的完整预测轨迹调用概率化填充，
+  ///       填充值为 MVP-0 固定的 existence_prob = 1.0f
+  for (auto it = sur_vehicle_trajs_fs.begin(); it != sur_vehicle_trajs_fs.end(); ++it) {
+    FillMapWithFsVehicleTrajProbabilistic(it->second);
+  }
+  return kSuccess;
+}
+
+/// @brief 概率化填充单条车辆 Frenet 轨迹到风险占据图
+/// @param traj 单辆周围车辆在 Frenet 坐标系下的完整预测轨迹 [frame_0, ... , frame_N]
+/// @return kSuccess 填充成功 / kWrongStatus 轨迹为空
+///
+/// @note 算法流程（与 FillMapWithFsVehicleTraj 几何逻辑相同，写入目标不同）:
+///       1. 空轨迹检查：traj.size() == 0 -> 返回错误
+///       2. 逐帧遍历：对每个时间帧执行:
+///          a. 顶点有效性验证: 所有轮廓顶点 s > 0
+///          b. Frenet坐标 -> 栅格坐标: 通过 p_3d_grid_->GetCoordUsingGlobalPosition
+///          c. 范围检查: p_3d_grid_->CheckCoordInRange
+///          d. 时间层计算: t_idx = coord[2]
+///          e. 偏移量计算: layer_offset = t_idx * w * h
+///          f. OpenCV填充: cv::fillPoly 写入 CV_32FC1 浮点图层
+///       3. 越界/无效帧静默跳过，不影响其他帧
+///
+/// @note MVP-0: existence_prob = 1.0f，将确定性轨迹镜像写入风险图。
+///       重叠区域会被后续 fillPoly 覆盖（最后写入者胜出），
+///       不做概率累加，不做 max 逻辑，不做时间衰减。
+///       后续 MVP-1 将传入真实存在概率替代 1.0f
+ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
+    const vec_E<common::FsVehicle> traj) {
+  /// @brief Step 1: 空轨迹检查 —— 轨迹为空时为无效输入
+  if (traj.size() == 0) {
+    LOG(ERROR) << "[Ssc] SscMap - Trajectory is empty (risk).";
+    return kWrongStatus;
+  }
+
+  /// @brief MVP-0 固定概率值 —— 确定性轨迹镜像，每条轨迹存在概率为 100%
+  /// @note 后续 MVP-1 将从 MOBIL 行为预测或 Bayesian 融合中获取真实概率
+  const float existence_prob = 1.0f;
+
+  /// @brief Step 2: 逐帧遍历轨迹，将每帧车辆轮廓写入风险栅格
+  for (int i = 0; i < static_cast<int>(traj.size()); ++i) {
+    bool is_valid = true;
+
+    /// @brief Step 2a: 验证所有轮廓顶点的 s 坐标 > 0
+    /// @note s <= 0 表示该点在自车后方或为无效数据，需跳过整帧
+    for (const auto& v : traj[i].vertices) {
+      if (v(0) <= 0) {
+        is_valid = false;
+        break;
+      }
+    }
+    if (!is_valid) continue;
+
+    /// @brief Step 2b: 将 Frenet 坐标 (s, d, t) 转换为 3D 栅格坐标 (ix, iy, it)
+    decimal_t z = traj[i].frenet_state.time_stamp;  // 当前帧的时间戳
+    int t_idx = 0;
+    std::vector<common::Point2i> v_coord;  // 该帧轮廓顶点的栅格坐标 (ix, iy)
+    std::array<decimal_t, 3> p_w;          // 临时 Frenet 坐标容器 (s, d, t)
+
+    for (const auto& v : traj[i].vertices) {
+      p_w = {v(0), v(1), z};
+      auto coord = p_3d_grid_->GetCoordUsingGlobalPosition(p_w);
+      t_idx = coord[2];  // 所有顶点应在同一时间层
+      if (!p_3d_grid_->CheckCoordInRange(coord)) {
+        is_valid = false;
+        break;
+      }
+      v_coord.push_back(common::Point2i(coord[0], coord[1]));
+    }
+    if (!is_valid) continue;
+
+    /// @brief Step 2c: 将栅格顶点转为 OpenCV Point2i 多边形格式
+    std::vector<std::vector<cv::Point2i>> vv_coord_cv;
+    std::vector<cv::Point2i> v_coord_cv;
+    common::ShapeUtils::GetCvPoint2iVecUsingCommonPoint2iVec(v_coord, &v_coord_cv);
+    vv_coord_cv.push_back(v_coord_cv);
+
+    /// @brief Step 2d: 计算该时间层在平铺一维数组中的偏移量
+    /// @note 布局: 按 t 分层，每层为 (d 行 × s 列) 的 row-major 矩阵
+    int w = p_3d_grid_->dims_size()[0];  // s 方向栅格数（图像宽度）
+    int h = p_3d_grid_->dims_size()[1];  // d 方向栅格数（图像高度）
+    int layer_offset = t_idx * w * h;    // 跳转到第 t_idx 时间层的起始地址
+
+    /// @brief Step 2e: 在风险占据图上执行多边形填充
+    /// @note CV_32FC1 = 单通道 32-bit 浮点数，值域 [0.0, 1.0]
+    ///       cv::Scalar(existence_prob) 将所有多边形内部像素设为存在概率
+    cv::Mat layer_mat(h, w, CV_32FC1, p_3d_risk_grid_.data() + layer_offset);
+    cv::fillPoly(layer_mat, vv_coord_cv, cv::Scalar(existence_prob));
   }
 
   return kSuccess;

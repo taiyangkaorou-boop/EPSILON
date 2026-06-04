@@ -52,6 +52,26 @@ namespace planning {
 using ObstacleMapType = uint8_t;   ///< 障碍物地图单元格数据类型
 using SscMapDataType = uint8_t;    ///< SSC 地图单元格数据类型
 
+/// @brief 风险占据图数据类型 —— 浮点概率值 [0.0, 1.0]
+/// @note 与 SscMapDataType (uint8_t 二值占据) 互补，用于表达碰撞风险的概率强度
+using RiskMapDataType = float;
+/// @brief 三维风险占据栅格图 —— 一维平铺存储，索引 = t_idx * w * h + d_idx * w + s_idx
+/// @note MVP-0 使用 std::vector<float> 而非 GridMapND<float,3>，
+///       避免对 common 库的额外模板实例化
+using RiskGridMap3D = std::vector<RiskMapDataType>;
+
+/// @brief 风险占据栅格统计结构 —— 用于 MVP-1A 验证风险图是否被正确填充和重置
+/// @note 由 ComputeRiskGridStats() 填充，PrintRiskGridStatsIfNeeded() 输出日志。
+///       该结构不参与任何规划决策，仅用于调试和验证
+struct RiskGridStats {
+  size_t total_cells = 0;                       ///< 风险图总栅格数
+  size_t nonzero_cells = 0;                      ///< 风险值 > 0 的栅格数
+  RiskMapDataType max_risk = 0.0f;               ///< 最大风险值
+  double sum_risk = 0.0;                         ///< 风险值总和 (double 累加避免 float 截断)
+  size_t active_time_layers = 0;                 ///< 至少有一个非零栅格的时间层数
+  std::vector<size_t> nonzero_cells_per_layer;   ///< 每时间层的非零栅格数 [layer_0, ... , layer_t-1]
+};
+
 /// @class SscMap
 /// @brief 三维时空占据栅格地图 —— SSC 规划器的环境表示层
 ///
@@ -130,6 +150,16 @@ class SscMap {
   /// @brief 获取膨胀后的障碍物占据栅格（3D）
   GridMap3D *p_3d_inflated_grid() const { return p_3d_inflated_grid_; }
 
+  /// @brief 获取风险占据栅格图的只读引用（调试/验证用）
+  /// @return 三维风险占据图的 const 引用，值为风险概率 [0.0, 1.0]
+  /// @note MVP-0 中风险图不参与 corridor/QP/行为选择，仅供外部调试读取
+  const RiskGridMap3D& risk_grid() const { return p_3d_risk_grid_; }
+
+  /// @brief 计算风险占据栅格的统计信息（只读，不修改任何地图数据）
+  /// @return RiskGridStats 结构体，包含 total/ nonzero/ max/ sum/ active_layers/ per_layer
+  /// @note MVP-1A: 用于验证 risk grid 是否被正确 reset 和填充，不参与规划决策
+  RiskGridStats ComputeRiskGridStats() const;
+
   /// @brief 获取配置
   Config config() const { return config_; }
 
@@ -200,7 +230,19 @@ class SscMap {
   /// @param ini_frenet_state 当前的初始 Frenet 状态
   ErrorType ResetSscMap(const common::FrenetState &ini_frenet_state);
 
+  /// @brief 重置风险占据图 —— 将所有栅格值清零为 0.0f
+  /// @return kSuccess
+  /// @note 仅清空风险图，不影响原始 binary 占据图
+  ErrorType ResetRiskMap();
+
  private:
+  /// @brief 按需输出风险占据栅格统计日志
+  /// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
+  /// @note MVP-1A: 使用 LOG(WARNING) 输出，前缀 [Ssc][RiskGridStats]。
+  ///       输出 summary 行（total/nonzero/max/sum/active_layers）和 per-layer 行。
+  ///       该函数不触发任何规划逻辑，不影响 corridor/QP/control
+  void PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const;
+
   /// @brief 检查立方体在 3D 栅格中是否完全无障碍
   /// 遍历立方体内所有栅格单元格，确认均为 0（空闲）
   bool CheckIfCubeIsFree(GridMap3D *p_grid,
@@ -299,11 +341,30 @@ class SscMap {
       const std::unordered_map<int, vec_E<common::FsVehicle>>
           &sur_vehicle_trajs_fs);
 
+  /// @brief 概率化填充动态障碍物 —— 遍历所有周围车辆并将其预测轨迹写入风险占据图
+  /// @param sur_vehicle_trajs_fs 周围车辆在 Frenet 坐标系下的预测轨迹
+  ///                              (key=车辆ID, value=Frenet车辆状态序列)
+  /// @return kSuccess
+  /// @note 与 FillDynamicPart 的区别：写入 p_3d_risk_grid_（float概率）而非
+  ///       p_3d_grid_（uint8_t二值占据）。MVP-0 中 existence_prob 固定为 1.0f
+  ErrorType FillDynamicPartProbabilistic(
+      const std::unordered_map<int, vec_E<common::FsVehicle>>
+          &sur_vehicle_trajs_fs);
+
   /// @brief 将单条 Frenet 车辆轨迹填充到 3D 栅格
   ///
   /// 使用策略：对轨迹中每帧的车辆轮廓顶点，在对应的 s-d 平面对应的 t 层上，
   /// 使用 OpenCV 的 fillPoly 填充多边形区域（实现精确的车辆形状占据）
   ErrorType FillMapWithFsVehicleTraj(const vec_E<common::FsVehicle> traj);
+
+  /// @brief 概率化填充单条车辆 Frenet 轨迹到风险占据图
+  /// @param traj 单辆周围车辆在 Frenet 坐标系下的完整预测轨迹
+  /// @return kSuccess 填充成功 / kWrongStatus 轨迹为空
+  /// @note 复用原始 FillMapWithFsVehicleTraj 的几何流程（坐标转换、范围检查、
+  ///       OpenCV fillPoly），但写入目标为 p_3d_risk_grid_（CV_32FC1），
+  ///       填充值为 existence_prob（MVP-0 固定 1.0f）
+  ErrorType FillMapWithFsVehicleTrajProbabilistic(
+      const vec_E<common::FsVehicle> traj);
 
   // =========================================================================
   // 成员变量
@@ -313,6 +374,12 @@ class SscMap {
   common::GridMapND<SscMapDataType, 3> *p_3d_grid_;
   /// 膨胀后的 3D 占据栅格地图
   common::GridMapND<SscMapDataType, 3> *p_3d_inflated_grid_;
+
+  /// @brief 三维风险占据栅格图 —— 浮点概率值 [0.0, 1.0]
+  /// @note MVP-0 定位: side-channel 调试数据，不参与 corridor 构建和 QP 优化。
+  ///       后续 MVP-1 将接入真实概率预测来源（MOBIL 概率/EUDM 不确定性），
+  ///       MVP-2 将作为 risk cost 或 chance constraint 的输入
+  RiskGridMap3D p_3d_risk_grid_;
 
   /// 立方体膨胀方向的禁用记录（暂未激活使用）
   std::unordered_map<int, std::array<bool, 6>> inters_for_cube_;
