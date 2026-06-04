@@ -1,7 +1,88 @@
 /**
  * @file ssc_planner.cc
  * @author HKUST Aerial Robotics Group
- * @brief implementation for ssc planner
+ * @brief SSC（时空语义走廊）规划器的核心实现
+ *
+ * [文件重要程度: 最高]
+ * 本文件实现了 EPSILON 系统中低层运动规划的全部核心算法。
+ *
+ * [完整算法流程]
+ *
+ *  Step 1. 数据准备 (RunOnce 前半部分)
+ *     a. 从地图接口读取当前环境快照：自车状态、参考车道、行为决策、障碍物、
+ *        多行为前向仿真轨迹、周围车辆预测轨迹
+ *     b. 通过 StateTransformer 将初始状态从全局坐标系转换至 Frenet 坐标系，
+ *        确定起始位置的 (s, d) 坐标及速度/加速度分量
+ *     c. 将自车速度与 low_speed_threshold 比较，确定运行模式：
+ *        - 高速: is_lateral_independent_ = true  (横向/纵向解耦)
+ *        - 低速: is_lateral_independent_ = false (使用 primitive 轨迹)
+ *
+ *  Step 2. 批量坐标变换 (StateTransformForInputData)
+ *     a. Stage I  - 数据打包:
+ *        将自车状态、所有前向轨迹状态、周围车辆预测状态，以及它们的车辆轮廓
+ *        顶点，统一打包成 global_state_vec 和 global_point_vec 两个扁平的
+ *        一维向量，以便批量处理。
+ *     b. Stage II - 执行变换 (单线程或 OpenMP 4 线程):
+ *        对 global_state_vec 中每个状态，调用 stf_.GetFrenetStateFromState()
+ *        转换为 FrenetState（包含 s, s_dot, s_ddot, d, d_dot, d_ddot）。
+ *        对 global_point_vec 中每个点，调用 stf_.GetFrenetPointFromPoint()
+ *        转换为 Frenet 坐标下的二维点。
+ *     c. Stage III - 结果恢复:
+ *        按打包时的偏移量从 frenet_state_vec 和 fs_point_vec 中提取各分量，
+ *        重建 fs_ego_vehicle_, forward_trajs_fs_, surround_forward_trajs_fs_,
+ *        obstacle_grids_fs_ 等 Frenet 坐标系下的数据结构。
+ *
+ *  Step 3. SSC 地图构建与走廊生成 (RunOnce 中的 SscMap 部分)
+ *     a. 设置时间原点 time_origin_ 为初始状态的时间戳
+ *     b. 调用 p_ssc_map_->ResetSscMap() 清空地图并更新原点
+ *     c. 对每一种行为 (i = 0..num_behaviors):
+ *        - 调用 ConstructSscMap() 构建 (s, d, t) 三维占据栅格:
+ *          * FillStaticPart:  将静态障碍物栅格填充到所有时间层
+ *          * FillDynamicPart: 将周围车辆预测轨迹逐帧填充（多边形填充）
+ *        - 调用 ConstructCorridorUsingInitialTrajectory() 构建时空走廊:
+ *          * Stage I  - 种子采样: 沿前向轨迹均匀采样点作为种子
+ *          * Stage II - 立方体膨胀: 从种子对生成初始立方体, 六方向膨胀
+ *        - (可选) InflateObstacleGrid() 对障碍物进行车辆尺寸膨胀
+ *     d. 调用 GetFinalGlobalMetricCubesList() 将栅格坐标走廊转为物理单位
+ *
+ *  Step 4. QP 轨迹优化 (RunQpOptimization)
+ *     a. 从 SscMap 获取各行为的时空走廊 cube_list 和有效性标志
+ *     b. 对每条有效走廊:
+ *        i.   提取起始约束 (3 组 Vecf<2>):
+ *             - [0]: 起始位置    (s, d)
+ *             - [1]: 起始速度    (s_dot, d_dot)，纵向速度有奇异保护(≥eps)
+ *             - [2]: 起始加速度  (s_ddot, d_ddot)
+ *        ii.  提取终止约束 (2 组 Vecf<2>):
+ *             - [0]: 终止位置    (s, d)  = 前向轨迹末端状态
+ *             - [1]: 终止速度    (s_dot, d_dot)
+ *             (终止加速度约束被注释掉以增加优化可行性)
+ *        iii. 修正走廊的终止时间: cube.back().t_ub = 前向轨迹终端时间
+ *        iv.  检查走廊可行性 (CorridorFeasibilityCheck): 验证相邻立方体
+ *             时间轴对齐 (t_ub[i-1] == t_lb[i])
+ *        v.   构建参考点序列 (ref_stamps, ref_points, ref_states):
+ *             以初始轨迹的各帧位置作为优化参考
+ *        vi.  调用 spline_generator.GetBezierSplineUsingCorridor():
+ *             - 输出: 5阶 2维 Bezier 样条 (s(t), d(t))
+ *             - 优化目标: 最小化 jerk 和加速度
+ *             - 约束: 所有采样时刻的轨迹点必须在时空走廊内
+ *             - 软约束: 尽量靠近参考点, 权重为 weight_proximity
+ *        vii. 低速模式下额外生成 primitive 轨迹 (FrenetPrimitive::Connect)
+ *     c. 将成功生成的轨迹、对应的走廊和参考点存入结果列表
+ *
+ *  Step 5. 轨迹选择 (UpdateTrajectoryWithCurrentBehavior)
+ *     a. 在有效轨迹中按优先级查找匹配行为:
+ *        优先级1: 精确匹配 ego_behavior_ (如 LeftLaneChange)
+ *        优先级2: 回退到 LaneKeeping 行为
+ *     b. 将匹配的 Bezier 样条和 primitive 轨迹分别封装为
+ *        FrenetBezierTrajectory 和 FrenetPrimitiveTrajectory
+ *     c. 通过 trajectory() 方法：高速返回 Bezier 样条轨迹，
+ *        低速返回 primitive 轨迹
+ *
+ * [性能优化]
+ *   - 使用 OpenMP (宏 USE_OPENMP) 可启用 4 线程并行坐标变换
+ *   - 默认关闭 OpenMP 以避免多核调度的不确定性
+ *   - 每个阶段有独立的 TicToc 计时器输出耗时
+ *
  * @version 0.1
  * @date 2019-02
  * @copyright Copyright (c) 2019
@@ -13,17 +94,27 @@
 #include <google/protobuf/text_format.h>
 #include <omp.h>
 
-// ! Performance can be significantly influenced by multi-core task scheduling
+// ! 多核任务调度会显著影响性能，默认关闭OpenMP
+// 可通过将此宏改为 1 启用4线程并行坐标变换
 #define USE_OPENMP 0
 
 namespace planning {
 
+/// @brief 返回规划器名称标识
 std::string SscPlanner::Name() { return std::string("ssc_planner"); }
 
+/// @brief 初始化规划器
+///
+/// 分两步：
+///   1. ReadConfig: 从 protobuf 文本文件加载配置
+///   2. 创建 SscMap: 将 protobuf 配置映射为 SscMap::Config 并实例化
+///
+/// @param config_path protobuf 文本格式配置文件路径
 ErrorType SscPlanner::Init(const std::string config_path) {
+  // 第一步：读取 protobuf 配置
   ReadConfig(config_path);
 
-  // * Planner config
+  // 打印规划器配置参数
   printf("\nSscPlanner Config:\n");
   printf(" -- weight_proximity: %lf\n", cfg_.planner_cfg().weight_proximity());
 
@@ -33,16 +124,22 @@ ErrorType SscPlanner::Init(const std::string config_path) {
   LOG(INFO) << "[Ssc] -- weight_proximity: "
             << cfg_.planner_cfg().weight_proximity();
 
-  // * SscMap config
+  // 第二步：构建 SscMap 配置并从 protobuf 映射参数
   SscMap::Config map_cfg;
-  map_cfg.map_size[0] = cfg_.map_cfg().map_size_x();
-  map_cfg.map_size[1] = cfg_.map_cfg().map_size_y();
-  map_cfg.map_size[2] = cfg_.map_cfg().map_size_z();
-  map_cfg.map_resolution[0] = cfg_.map_cfg().map_resl_x();
-  map_cfg.map_resolution[1] = cfg_.map_cfg().map_resl_y();
-  map_cfg.map_resolution[2] = cfg_.map_cfg().map_resl_z();
-  map_cfg.s_back_len = cfg_.map_cfg().s_back_len();
+
+  // --- 地图尺寸与分辨率 ---
+  map_cfg.map_size[0] = cfg_.map_cfg().map_size_x();          // s轴栅格数
+  map_cfg.map_size[1] = cfg_.map_cfg().map_size_y();          // d轴栅格数
+  map_cfg.map_size[2] = cfg_.map_cfg().map_size_z();          // t轴栅格数
+  map_cfg.map_resolution[0] = cfg_.map_cfg().map_resl_x();    // s分辨率 (m)
+  map_cfg.map_resolution[1] = cfg_.map_cfg().map_resl_y();    // d分辨率 (m)
+  map_cfg.map_resolution[2] = cfg_.map_cfg().map_resl_z();    // t分辨率 (s)
+  map_cfg.s_back_len = cfg_.map_cfg().s_back_len();           // s向后预留
+
+  // --- 运动学约束 (从 protobuf 的 dyn_bounds 子消息读取) ---
   map_cfg.kMaxLongitudinalVel = cfg_.map_cfg().dyn_bounds().max_lon_vel();
+  // 最小纵向速度取配置值和速度奇异阈值中的较大值,
+  // 避免极小速度导致的数值不稳定
   map_cfg.kMinLongitudinalVel =
       std::max(cfg_.map_cfg().dyn_bounds().min_lon_vel(),
                cfg_.planner_cfg().velocity_singularity_eps());
@@ -51,17 +148,23 @@ ErrorType SscPlanner::Init(const std::string config_path) {
   map_cfg.kMaxLateralVel = cfg_.map_cfg().dyn_bounds().max_lat_vel();
   map_cfg.kMaxLateralAcc = cfg_.map_cfg().dyn_bounds().max_lat_acc();
   map_cfg.kMaxNumOfGridAlongTime = cfg_.map_cfg().max_grids_along_time();
+
+  // --- 六方向膨胀步长 (依次为: s+, s-, d+, d-, t+, t-) ---
   map_cfg.inflate_steps[0] = cfg_.map_cfg().infl_steps().x_p();
   map_cfg.inflate_steps[1] = cfg_.map_cfg().infl_steps().x_n();
   map_cfg.inflate_steps[2] = cfg_.map_cfg().infl_steps().y_p();
   map_cfg.inflate_steps[3] = cfg_.map_cfg().infl_steps().y_n();
   map_cfg.inflate_steps[4] = cfg_.map_cfg().infl_steps().z_p();
   map_cfg.inflate_steps[5] = cfg_.map_cfg().infl_steps().z_n();
+
+  // 创建 SSC 地图实例
   p_ssc_map_ = new SscMap(map_cfg);
 
   return kSuccess;
 }
 
+/// @brief 从 protobuf 文本文件读取配置
+/// @param config_path 配置文件的绝对路径或相对路径
 ErrorType SscPlanner::ReadConfig(const std::string config_path) {
   printf("\n[EudmPlanner] Loading ssc planner config\n");
   using namespace google::protobuf;
@@ -75,13 +178,21 @@ ErrorType SscPlanner::ReadConfig(const std::string config_path) {
   return kSuccess;
 }
 
+/// @brief 设置规划起始状态（外部接口，用于闭环仿真）
+/// 调用后 has_initial_state_ 置为 true，下一帧 RunOnce 将使用此状态而非自车当前状态
 ErrorType SscPlanner::set_initial_state(const State& state) {
   initial_state_ = state;
   has_initial_state_ = true;
   return kSuccess;
 }
 
+/// @brief 执行一次完整的规划循环 —— SSC 算法的顶层入口
+///
+/// 完整流程的每一步都有独立的 TicToc 计时器，输出各阶段耗时用于性能分析。
+/// 总耗时通过 time_cost_ 记录，各子阶段之和与总耗时的差异 (diff) 反映
+/// 步骤间的调度开销。
 ErrorType SscPlanner::RunOnce() {
+  // 获取地图时间戳作为本帧标识
   stamp_ = map_itf_->GetTimeStamp();
   LOG(WARNING) << std::fixed << std::setprecision(4)
                << "[Ssc]******************** RUNONCE START: " << stamp_
@@ -89,50 +200,66 @@ ErrorType SscPlanner::RunOnce() {
   static TicToc ssc_timer;
   ssc_timer.tic();
 
+  // ===================================================================
+  // 阶段1: 数据准备 - 从地图接口读取环境快照 (prepare)
+  // ===================================================================
   static TicToc timer_prepare;
   timer_prepare.tic();
+
+  // 1a. 获取自车车辆信息（状态 + 物理参数）
   if (map_itf_->GetEgoVehicle(&ego_vehicle_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get ego vehicle info.";
     return kWrongStatus;
   }
 
-  // plan state
+  // 1b. 确定初始规划状态
+  // 若有外部设置的状态 (from Replan) 则使用之, 否则使用自车当前状态
   if (!has_initial_state_) {
     initial_state_ = ego_vehicle_.state();
   }
-  has_initial_state_ = false;
+  has_initial_state_ = false;  // 单次消费后复位
 
+  // 1c. 判断横向独立性 (高速 vs 低速模式)
+  // 高速时横向运动可解耦, 利于 QP 优化的可行性
   is_lateral_independent_ =
       initial_state_.velocity > cfg_.planner_cfg().low_speed_threshold()
           ? true
           : false;
+
+  // 1d. 获取局部参考车道 (用于 StateTransformer 初始化)
   if (map_itf_->GetLocalReferenceLane(&nav_lane_local_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to find ego lane.";
     return kWrongStatus;
   }
+  // 用参考车道初始化状态变换器 (笛卡尔 <-> Frenet)
   stf_ = common::StateTransformer(nav_lane_local_);
 
+  // 1e. 将初始状态由笛卡尔坐标转换为 Frenet 坐标
   if (stf_.GetFrenetStateFromState(initial_state_, &initial_frenet_state_) !=
       kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get init state frenet state.";
     return kWrongStatus;
   }
 
+  // 1f. 获取自车当前行为决策 (LaneKeeping / LeftLaneChange / RightLaneChange)
   if (map_itf_->GetEgoDiscretBehavior(&ego_behavior_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get ego behavior.";
     return kWrongStatus;
   }
 
+  // 1g. 获取 2D 障碍物占据栅格地图
   if (map_itf_->GetObstacleMap(&grid_map_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get obstacle map.";
     return kWrongStatus;
   }
 
+  // 1h. 获取障碍物占据栅格坐标集合 (离散化的障碍物位置)
   if (map_itf_->GetObstacleGrids(&obstacle_grids_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get obstacle grids.";
     return kWrongStatus;
   }
 
+  // 1i. 获取多行为前向仿真轨迹 + 周围车辆预测轨迹
   if (map_itf_->GetForwardTrajectories(&forward_behaviors_, &forward_trajs_,
                                        &surround_forward_trajs_) != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to get forward trajectories.";
@@ -142,6 +269,9 @@ ErrorType SscPlanner::RunOnce() {
   auto t_prepare = timer_prepare.toc();
   LOG(WARNING) << "[Ssc]prepare time cost: " << t_prepare << " ms";
 
+  // ===================================================================
+  // 阶段2: 批量坐标变换 - 笛卡尔 -> Frenet (state transform)
+  // ===================================================================
   static TicToc timer_stf;
   timer_stf.tic();
   if (StateTransformForInputData() != kSuccess) {
@@ -151,48 +281,67 @@ ErrorType SscPlanner::RunOnce() {
   auto t_stf = timer_stf.toc();
   LOG(WARNING) << "[Ssc]state transform time cost: " << t_stf << " ms";
 
-  static TicToc timer_sscmap;  // ! SscMap part sometimes can be very slow
-                               // ! (Maybe CPU scheduling?)
+  // ===================================================================
+  // 阶段3: SSC 地图构建 + 时空走廊生成 (SscMap part)
+  // 注意: 此阶段有时可能非常慢, 可能与CPU调度有关
+  // ===================================================================
+  static TicToc timer_sscmap;
   timer_sscmap.tic();
+
+  // 3a. 设置时间原点 (整个规划的时间基线)
   time_origin_ = initial_state_.time_stamp;
+  // 重置 SscMap: 清空栅格和走廊, 更新地图原点
   p_ssc_map_->ResetSscMap(initial_frenet_state_);
-  // ~ For closed-loop simulation prediction
+
+  // 3b. 对每种行为: 构建地图并生成走廊
   int num_behaviors = forward_behaviors_.size();
   for (int i = 0; i < num_behaviors; ++i) {
+    // 3b-i. 若非仅拟合模式 (is_fitting_only=false), 构建时空占据地图
     if (!cfg_.planner_cfg().is_fitting_only()) {
+      // 将当前行为下的周围车辆轨迹和静态障碍物栅格写入 3D 栅格
       if (p_ssc_map_->ConstructSscMap(surround_forward_trajs_fs_[i],
                                       obstacle_grids_fs_)) {
         LOG(ERROR) << "[Ssc]fail to construct ssc map.";
         return kWrongStatus;
       }
     }
-    // ! Notice: No inflation here to save time in eudm project. Improve
-    // ! efficiency in the future.
-    // TicToc timer_infl;
+
+    // 3b-ii. (可选) 障碍物膨胀 — EUDM 项目中为节省时间而省略
+    // InflateObstacleGrid 会根据车辆尺寸对障碍物进行膨胀
     // p_ssc_map_->InflateObstacleGrid(ego_vehicle_.param());
-    // printf("[SscPlanner] InflateObstacleGrid time cost: %lf ms\n",
-    //        timer_infl.toc());
+
+    // 3b-iii. 沿该行为的前向轨迹构建时空走廊
+    // 核心：从初始轨迹采样种子，膨胀为无碰撞立方体序列
     if (p_ssc_map_->ConstructCorridorUsingInitialTrajectory(
             p_ssc_map_->p_3d_grid(), forward_trajs_fs_[i]) != kSuccess) {
       LOG(ERROR) << "[Ssc]fail to construct corridor for behavior " << i;
       return kWrongStatus;
     }
   }
+
+  // 3c. 将每种行为的走廊从栅格坐标转换为物理单位 (米, 秒)
   if (kSuccess != p_ssc_map_->GetFinalGlobalMetricCubesList()) {
     LOG(ERROR) << "[Ssc]fail to get final corridor";
     return kWrongStatus;
   }
+
   auto t_sscmap = timer_sscmap.toc();
   LOG(WARNING) << "[Ssc]construct ssc map and corridor time cost: " << t_sscmap
                << " ms";
 
+  // ===================================================================
+  // 阶段4: QP 轨迹优化 (RunQpOptimization)
+  // ===================================================================
   static TicToc timer_opt;
   timer_opt.tic();
+
+  // 4a. 运行 QP 优化: 在时空走廊约束内拟合光滑 Bezier 样条轨迹
   if (RunQpOptimization() != kSuccess) {
     LOG(ERROR) << "[Ssc]fail to optimize qp trajectories.\n";
     return kWrongStatus;
   }
 
+  // 4b. 从优化结果中选择与当前行为匹配的轨迹
   if (UpdateTrajectoryWithCurrentBehavior() != kSuccess) {
     LOG(ERROR) << "[Ssc]fail: current behavior "
                << static_cast<int>(ego_behavior_) << " not valid.";
@@ -201,6 +350,8 @@ ErrorType SscPlanner::RunOnce() {
     return kWrongStatus;
   }
 
+  // 4c. (已禁用) 轨迹验证: 检查起点、终点一致性和曲率约束
+  // #if 0 块内的 ValidateTrajectory 检查因可能导致过度严格的拒绝而默认关闭
 #if 0
   auto traj = trajectory();
   if (ValidateTrajectory(*traj) != kSuccess) {
@@ -212,6 +363,9 @@ ErrorType SscPlanner::RunOnce() {
   auto t_opt = timer_opt.toc();
   LOG(WARNING) << "[Ssc]optimization time cost: " << t_opt << " ms";
 
+  // ===================================================================
+  // 汇总计时: 输出各阶段耗时和调度开销
+  // ===================================================================
   auto t_sum = t_prepare + t_stf + t_sscmap + t_opt;
   time_cost_ = ssc_timer.toc();
   LOG(WARNING) << std::fixed << std::setprecision(4)
@@ -224,11 +378,30 @@ ErrorType SscPlanner::RunOnce() {
   return kSuccess;
 }  // namespace planning
 
+/// @brief QP 轨迹优化 —— 在时空走廊约束内拟合光滑轨迹的核心函数
+///
+/// 算法详解:
+///   对每种行为对应的时空走廊，调用 SplineGenerator 生成 5 阶 2 维 Bezier 样条。
+///   Bezier 样条定义在归一化参数区间 [0,1] 上，实际时间线性映射到该区间。
+///   优化问题形式化为:
+///     min  w_j * ∫(jerk^2) + w_a * ∫(acc^2) + w_p * Σ||p(t_k) - ref_k||^2
+///     s.t. 对于所有 t_k ∈ [t_start, t_end]:
+///             p_lb(t_k) ≤ p(t_k) ≤ p_ub(t_k)  (位置在走廊内)
+///             v_lb(t_k) ≤ v(t_k) ≤ v_ub(t_k)  (速度边界)
+///             a_lb(t_k) ≤ a(t_k) ≤ a_ub(t_k)  (加速度边界)
+///           起始状态硬约束
+///             p(t_start) = p_start, v(t_start) = v_start, a(t_start) = a_start
+///
+/// @return kSuccess 表示至少有一条行为生成了有效的优化轨迹
 ErrorType SscPlanner::RunQpOptimization() {
+  // 获取各行为的物理坐标时空走廊和有效性标志
   vec_E<vec_E<common::SpatioTemporalSemanticCubeNd<2>>> cube_list =
       p_ssc_map_->final_corridor_vec();
   std::vector<int> if_corridor_valid = p_ssc_map_->if_corridor_valid();
+
   if (cube_list.empty()) return kWrongStatus;
+
+  // 一致性检查: 走廊数量必须等于行为数量
   if (cube_list.size() != forward_behaviors_.size()) {
     LOG(ERROR) << "[Ssc]cube list " << static_cast<int>(cube_list.size())
                << " not consist with behavior size: "
@@ -238,13 +411,18 @@ ErrorType SscPlanner::RunQpOptimization() {
     return kWrongStatus;
   }
 
+  // 清空上一帧优化结果
   qp_trajs_.clear();
   primitive_trajs_.clear();
   valid_behaviors_.clear();
   corridors_.clear();
   ref_states_list_.clear();
+
+  // 遍历每种行为的走廊，逐一优化
   for (int i = 0; i < static_cast<int>(cube_list.size()); i++) {
     int beh = static_cast<int>(forward_behaviors_[i]);
+
+    // 跳过无效走廊
     if (if_corridor_valid[i] == 0) {
       LOG(ERROR) << "[Ssc]fail: for behavior "
                  << static_cast<int>(forward_behaviors_[i])
@@ -255,43 +433,63 @@ ErrorType SscPlanner::RunQpOptimization() {
     auto fs_vehicle_traj = forward_trajs_fs_[i];
     int num_states = static_cast<int>(fs_vehicle_traj.size());
 
+    // ===================================================================
+    // 步骤1: 构建起始约束 (3组 Vecf<2>)
+    //   约束0: 起始位置    (s, d)
+    //   约束1: 起始速度    (s_dot, d_dot)，纵向速度做奇异保护
+    //   约束2: 起始加速度  (s_ddot, d_ddot)
+    // ===================================================================
     vec_E<Vecf<2>> start_constraints;
+    // 起始位置约束
     start_constraints.push_back(
         Vecf<2>(ego_frenet_state_.vec_s[0], ego_frenet_state_.vec_dt[0]));
+    // 起始速度约束: 纵向速度使用 max(v, eps) 防止零速奇异性
     start_constraints.push_back(
         Vecf<2>(std::max(ego_frenet_state_.vec_s[1],
                          cfg_.planner_cfg().velocity_singularity_eps()),
                 ego_frenet_state_.vec_dt[1]));
+    // 起始加速度约束
     start_constraints.push_back(
         Vecf<2>(ego_frenet_state_.vec_s[2], ego_frenet_state_.vec_dt[2]));
 
-    // printf("[Inconsist]Start sd position (%lf, %lf).\n",
-    // start_constraints[0](0),
-    //        start_constraints[0](1));
+    // ===================================================================
+    // 步骤2: 构建终止约束 (2组 Vecf<2>)
+    //   约束0: 终止位置    (s, d) = 前向轨迹最后一帧的位置
+    //   约束1: 终止速度    (s_dot, d_dot) = 前向轨迹最后一帧的速度
+    //   注意: 终止加速度约束被注释掉，仅以位置和速度作为软目标
+    // ===================================================================
     vec_E<Vecf<2>> end_constraints;
+    // 终止位置约束
     end_constraints.push_back(
         Vecf<2>(fs_vehicle_traj[num_states - 1].frenet_state.vec_s[0],
                 fs_vehicle_traj[num_states - 1].frenet_state.vec_dt[0]));
+    // 终止速度约束 (同样做奇异保护)
     end_constraints.push_back(
         Vecf<2>(std::max(fs_vehicle_traj[num_states - 1].frenet_state.vec_s[1],
                          cfg_.planner_cfg().velocity_singularity_eps()),
                 fs_vehicle_traj[num_states - 1].frenet_state.vec_dt[1]));
-    // end_constraints.push_back(
-    //     Vecf<2>(fs_vehicle_traj[num_states - 1].frenet_state.vec_s[2],
-    //             fs_vehicle_traj[num_states - 1].frenet_state.vec_dt[2]));
+
+    // 实例化 5阶2维样条生成器
     common::SplineGenerator<5, 2> spline_generator;
     BezierSpline bezier_spline;
 
+    // 修正走廊终止时间: 使用前向轨迹的实际终端时间
     cube_list[i].back().t_ub = fs_vehicle_traj.back().frenet_state.time_stamp;
 
+    // 检查走廊可行性: 验证相邻立方体时间轴是否连续可通
     if (CorridorFeasibilityCheck(cube_list[i]) != kSuccess) {
       LOG(ERROR) << "[Ssc]fail: corridor not valid for optimization.";
       continue;
     }
 
-    std::vector<decimal_t> ref_stamps;
-    vec_E<Vecf<2>> ref_points;
-    vec_E<common::FrenetState> ref_states;
+    // ===================================================================
+    // 步骤3: 构建优化参考点序列
+    //   以初始前向轨迹的各帧 Frenet 状态作为优化的软参考目标。
+    //   优化器会尽量使结果靠近这些参考点 (受 weight_proximity 权重控制)。
+    // ===================================================================
+    std::vector<decimal_t> ref_stamps;       // 参考时间戳序列
+    vec_E<Vecf<2>> ref_points;               // 参考 (s, d) 位置序列
+    vec_E<common::FrenetState> ref_states;   // 参考 Frenet 状态序列
     for (int n = 0; n < num_states; n++) {
       ref_stamps.push_back(fs_vehicle_traj[n].frenet_state.time_stamp);
       ref_points.push_back(Vecf<2>(fs_vehicle_traj[n].frenet_state.vec_s[0],
@@ -299,14 +497,26 @@ ErrorType SscPlanner::RunQpOptimization() {
       ref_states.push_back(fs_vehicle_traj[n].frenet_state);
     }
 
+    // ===================================================================
+    // 步骤4: 调用 Bezier 样条生成器 — 核心的 QP 优化过程
+    //
+    // GetBezierSplineUsingCorridor 内部执行:
+    //   a. 根据时间区间构建归一化参数映射
+    //   b. 通过 QP 求解最优 Bezier 控制点
+    //   c. 约束采样: 在每段时间区间内采样多个配置点
+    //   d. 目标函数: w_j*Σ||jerk||^2 + w_a*Σ||acc||^2 + w_p*Σ||p-ref||^2
+    //   e. 返回优化结果 bezier_spline
+    // ===================================================================
     bool bezier_spline_gen_success = true;
     if (spline_generator.GetBezierSplineUsingCorridor(
             cube_list[i], start_constraints, end_constraints, ref_stamps,
             ref_points, cfg_.planner_cfg().weight_proximity(),
             &bezier_spline) != kSuccess) {
+      // QP 优化失败时的详细诊断日志输出
       if (is_lateral_independent_) {
         LOG(ERROR) << "[Ssc]fail: solver error for behavior "
                    << static_cast<int>(forward_behaviors_[i]);
+        // 打印完整走廊信息供调试
         decimal_t t0 = cube_list[i].front().t_lb;
         for (auto& cube : cube_list[i]) {
           LOG(ERROR) << std::fixed << std::setprecision(3) << "[Ssc] t: ["
@@ -314,12 +524,14 @@ ErrorType SscPlanner::RunQpOptimization() {
                      << cube.p_lb[0] << ", " << cube.p_ub[0] << "], y: ["
                      << cube.p_lb[1] << ", " << cube.p_ub[1] << "]";
         }
+        // 打印参考点序列
         LOG(ERROR) << "[Ssc]ref points: ";
         for (int k = 0; k < ref_stamps.size(); ++k) {
           LOG(ERROR) << std::fixed << std::setprecision(4) << "[Ssc]" << k
                      << " t: " << ref_stamps[k] << ", x: " << ref_points[k].x()
                      << ", y: " << ref_points[k].y();
         }
+        // 打印全局坐标下的前向轨迹
         LOG(ERROR) << "[Ssc]forward traj: ";
         for (int k = 0; k < forward_trajs_[i].size(); ++k) {
           auto v = forward_trajs_[i][k];
@@ -332,6 +544,7 @@ ErrorType SscPlanner::RunQpOptimization() {
         LOG(ERROR) << "[Ssc]ref lane range: [" << nav_lane_local_.begin()
                    << ", " << nav_lane_local_.end() << "]";
 
+        // 打印起始终止约束的具体数值
         LOG(ERROR) << std::fixed << std::setprecision(4)
                    << "[Ssc]Start sd velocity (" << start_constraints[1](0)
                    << ", " << start_constraints[1](1) << ")";
@@ -351,8 +564,13 @@ ErrorType SscPlanner::RunQpOptimization() {
       bezier_spline_gen_success = false;
     }
 
+    // ===================================================================
+    // 步骤5: 低速模式下生成备选 primitive 轨迹
+    //   primitive 轨迹通过 Connect 方法连接当前 Frenet 状态到目标状态
+    // ===================================================================
     FrenetPrimitive primitive;
     if (!is_lateral_independent_) {
+      // 低速模式：使用横向依赖的 primitive 连接
       primitive.Connect(initial_frenet_state_,
                         fs_vehicle_traj.back().frenet_state,
                         initial_frenet_state_.time_stamp,
@@ -361,22 +579,40 @@ ErrorType SscPlanner::RunQpOptimization() {
                         is_lateral_independent_);
     }
 
+    // 高速模式且 Bezier 生成失败: 跳过此行为
     if (is_lateral_independent_ && !bezier_spline_gen_success) continue;
-    // printf("[SscQP]spline begin stamp: %lf.\n", bezier_spline.begin());
+
+    // 保存成功结果
     qp_trajs_.push_back(bezier_spline);
     primitive_trajs_.push_back(primitive);
     corridors_.push_back(cube_list[i]);
     ref_states_list_.push_back(ref_states);
     valid_behaviors_.push_back(forward_behaviors_[i]);
   }
+
   return kSuccess;
 }
 
+/// @brief 根据当前自车行为从有效轨迹中选择匹配的轨迹
+///
+/// 选择策略 (两级回退):
+///   Level 1: 精确匹配 ego_behavior_ (如自车正在左变道, 优先选左变道轨迹)
+///   Level 2: 若无精确匹配, 回退到 kLaneKeeping 行为 (安全性兜底)
+///
+/// 结果:
+///   - trajectory_:               选中的 Bezier 样条轨迹
+///   - low_spd_alternative_traj_: 选中的备选 primitive 轨迹
+///   - final_corridor_:           选中轨迹对应的时空走廊
+///   - final_ref_states_:         选中轨迹的参考状态
+///
+/// @return 若有效轨迹为空且无回退行为, 返回 kWrongStatus
 ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
   int num_valid_behaviors = static_cast<int>(valid_behaviors_.size());
   if (num_valid_behaviors < 1) {
     return kWrongStatus;
   }
+
+  // Level 1: 查找精确匹配的行为
   bool find_exact_match_behavior = false;
   int index = 0;
   for (int i = 0; i < num_valid_behaviors; i++) {
@@ -385,6 +621,8 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
       index = i;
     }
   }
+
+  // Level 2: 回退到 LaneKeeping
   bool find_candidate_behavior = false;
   LateralBehavior candidate_bahavior = common::LateralBehavior::kLaneKeeping;
   if (!find_exact_match_behavior) {
@@ -395,17 +633,32 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
       }
     }
   }
+
+  // 两级别均未找到: 报告失败
   if (!find_exact_match_behavior && !find_candidate_behavior)
     return kWrongStatus;
 
+  // 封装最终轨迹: 高速用 Bezier, 低速用 primitive
   trajectory_ = FrenetBezierTrajectory(qp_trajs_[index], stf_);
   low_spd_alternative_traj_ =
       FrenetPrimitiveTrajectory(primitive_trajs_[index], stf_);
   final_corridor_ = corridors_[index];
   final_ref_states_ = ref_states_list_[index];
+
   return kSuccess;
 }
 
+/// @brief 时空走廊可行性检查
+///
+/// 检查项:
+///   1. 走廊至少有一个立方体
+///   2. 相邻立方体的时间区间必须连续: t_ub[i-1] == t_lb[i]
+///
+/// 这是 QP 优化的重要前提条件。若时间轴不连续, 样条在过渡处
+/// 可能没有有效的约束区间, 导致优化问题不可行或解不合法。
+///
+/// @param cubes 待检查的时空语义立方体序列
+/// @return kSuccess 表示走廊连续有效, 可以安全交给 QP 优化
 ErrorType SscPlanner::CorridorFeasibilityCheck(
     const vec_E<common::SpatioTemporalSemanticCubeNd<2>>& cubes) {
   int num_cubes = static_cast<int>(cubes.size());
@@ -413,6 +666,7 @@ ErrorType SscPlanner::CorridorFeasibilityCheck(
     LOG(ERROR) << "[Ssc]number of cubes not enough.";
     return kWrongStatus;
   }
+  // 逐一检查相邻立方体的时间连续性
   for (int i = 1; i < num_cubes; i++) {
     if (cubes[i - 1].t_ub != cubes[i].t_lb) {
       LOG(ERROR) << "[Ssc]Err- Corridor not consist.";
@@ -430,32 +684,56 @@ ErrorType SscPlanner::CorridorFeasibilityCheck(
   return kSuccess;
 }
 
+/// @brief 批量坐标变换: 将所有需要的数据从笛卡尔坐标系转换至 Frenet 坐标系
+///
+/// 这是 SSC 算法中最重要的预处理步骤。所有后续的时空地图构建、
+/// 走廊膨胀和 QP 优化都建立在 Frenet 坐标系之上。
+///
+/// 三阶段处理流程:
+///   Stage I:   数据打包 — 将多种来源的状态和点平铺为连续向量
+///   Stage II:  执行变换 — 使用 StateTransformer 批量转换
+///   Stage III: 结果恢复 — 按打包偏移量重建各数据结构
+///
+/// 数据打包顺序 (决定了恢复时的偏移量计算):
+///   1. 自车状态 + 自车轮廓顶点 (num_v 个顶点)
+///   2. 各行为下自车前向轨迹的所有状态 + 轮廓顶点
+///   3. 各行为下周围车辆预测轨迹的所有状态 + 轮廓顶点
+///   4. 静态障碍物栅格坐标
+///
+/// 支持多线程 (OpenMP) 或单线程模式, 由编译宏 USE_OPENMP 控制。
+///
+/// @return 错误码
 ErrorType SscPlanner::StateTransformForInputData() {
-  vec_E<State> global_state_vec;
-  vec_E<Vec2f> global_point_vec;
-  int num_v;
+  vec_E<State> global_state_vec;    // 全局状态平铺向量
+  vec_E<Vec2f> global_point_vec;    // 全局坐标点平铺向量
+  int num_v;                        // 车辆轮廓顶点数
 
-  // ~ Stage I. Package states and points
-  // * Ego vehicle state and vertices
+  // ===================================================================
+  // Stage I: 将状态和点打包为平坦的连续向量
+  // ===================================================================
+
+  // * 1. 自车状态 + 顶点
   {
     global_state_vec.push_back(initial_state_);
     vec_E<Vec2f> v_vec;
+    // 使用车辆参数计算在初始状态下自车矩形的四个顶点
     common::SemanticsUtils::GetVehicleVertices(ego_vehicle_.param(),
                                                initial_state_, &v_vec);
     num_v = v_vec.size();
+    // global_point_vec 的前 num_v 个元素对应自车轮廓顶点
     global_point_vec.insert(global_point_vec.end(), v_vec.begin(), v_vec.end());
   }
 
-  // * Ego forward simulation trajs states and vertices
+  // * 2. 自车前向仿真轨迹的所有状态 + 顶点
+  //    每条轨迹的每帧都包含一个状态 + num_v 个轮廓顶点
   {
     common::VehicleParam ego_param = ego_vehicle_.param();
     for (int i = 0; i < (int)forward_trajs_.size(); ++i) {
       if (forward_trajs_[i].size() < 1) continue;
       for (int k = 0; k < (int)forward_trajs_[i].size(); ++k) {
-        // states
         State traj_state = forward_trajs_[i][k].state();
         global_state_vec.push_back(traj_state);
-        // vertices
+
         vec_E<Vec2f> v_vec;
         common::SemanticsUtils::GetVehicleVertices(ego_param, traj_state,
                                                    &v_vec);
@@ -465,17 +743,18 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * Surrounding vehicle trajs from MPDM
+  // * 3. 周围车辆预测轨迹的所有状态 + 顶点
+  //    结构: surround_forward_trajs_[behavior_i][vehicle_id][frame_k]
   {
     for (int i = 0; i < surround_forward_trajs_.size(); ++i) {
       for (auto it = surround_forward_trajs_[i].begin();
            it != surround_forward_trajs_[i].end(); ++it) {
         for (int k = 0; k < it->second.size(); ++k) {
-          // states
           State traj_state = it->second[k].state();
           global_state_vec.push_back(traj_state);
-          // vertices
+
           vec_E<Vec2f> v_vec;
+          // 注意: 每辆车可能有不同的物理参数
           common::SemanticsUtils::GetVehicleVertices(it->second[k].param(),
                                                      traj_state, &v_vec);
           global_point_vec.insert(global_point_vec.end(), v_vec.begin(),
@@ -485,7 +764,7 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * Obstacle grids
+  // * 4. 静态障碍物栅格坐标
   {
     for (auto it = obstacle_grids_.begin(); it != obstacle_grids_.end(); ++it) {
       Vec2f pt((*it)[0], (*it)[1]);
@@ -493,10 +772,13 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
+  // 预分配结果向量（避免动态扩容）
   vec_E<FrenetState> frenet_state_vec(global_state_vec.size());
   vec_E<Vec2f> fs_point_vec(global_point_vec.size());
 
-  // ~ Stage II. Do transformation in multi-thread flavor
+  // ===================================================================
+  // Stage II: 执行坐标变换 (单线程或多线程)
+  // ===================================================================
 #if USE_OPENMP
   TicToc timer_stf;
   StateTransformUsingOpenMp(global_state_vec, global_point_vec,
@@ -511,19 +793,23 @@ ErrorType SscPlanner::StateTransformForInputData() {
                << " ms.";
 #endif
 
-  // ~ Stage III. Retrieve states and points
+  // ===================================================================
+  // Stage III: 按打包偏移量从结果向量中恢复各数据结构
+  //            关键: offset 维护当前处理到的状态索引
+  // ===================================================================
   int offset = 0;
-  // * Ego vehicle state and vertices
+
+  // * 恢复 1: 自车 Frenet 状态 + 轮廓顶点
   {
     fs_ego_vehicle_.frenet_state = frenet_state_vec[offset];
     fs_ego_vehicle_.vertices.clear();
     for (int i = 0; i < num_v; ++i) {
       fs_ego_vehicle_.vertices.push_back(fs_point_vec[offset * num_v + i]);
     }
-    offset++;
+    offset++;  // 自车状态消耗一个状态索引
   }
 
-  // * Ego forward simulation trajs states and vertices
+  // * 恢复 2: 各行为下自车前向仿真轨迹 (Frenet 坐标)
   {
     forward_trajs_fs_.clear();
     if (forward_trajs_.size() < 1) return kWrongStatus;
@@ -533,24 +819,25 @@ ErrorType SscPlanner::StateTransformForInputData() {
       for (int k = 0; k < (int)forward_trajs_[j].size(); ++k) {
         common::FsVehicle fs_v;
         fs_v.frenet_state = frenet_state_vec[offset];
+        // 从 point 向量中提取该帧对应的 num_v 个轮廓顶点
         for (int i = 0; i < num_v; ++i) {
           fs_v.vertices.push_back(fs_point_vec[offset * num_v + i]);
         }
         traj_fs.emplace_back(fs_v);
-        offset++;
+        offset++;  // 每帧消耗一个状态索引
       }
       forward_trajs_fs_.emplace_back(traj_fs);
     }
   }
 
-  // * Surrounding vehicle trajs from MPDM
+  // * 恢复 3: 各行为下周围车辆预测轨迹 (Frenet 坐标)
   {
     surround_forward_trajs_fs_.clear();
     for (int j = 0; j < surround_forward_trajs_.size(); ++j) {
       std::unordered_map<int, vec_E<common::FsVehicle>> sur_trajs;
       for (auto it = surround_forward_trajs_[j].begin();
            it != surround_forward_trajs_[j].end(); ++it) {
-        int v_id = it->first;
+        int v_id = it->first;  // 车辆ID
         vec_E<common::FsVehicle> traj_fs;
         for (int k = 0; k < it->second.size(); ++k) {
           common::FsVehicle fs_v;
@@ -568,7 +855,7 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * Obstacle grids
+  // * 恢复 4: 障碍物栅格的 Frenet 坐标
   {
     obstacle_grids_fs_.clear();
     for (int i = 0; i < static_cast<int>(obstacle_grids_.size()); ++i) {
@@ -576,33 +863,50 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
+  // 从自车 Frenet 车辆对象中提取状态作为便捷引用
   ego_frenet_state_ = fs_ego_vehicle_.frenet_state;
   return kSuccess;
 }
 
+/// @brief OpenMP 多线程坐标变换
+///
+/// 使用 4 线程并行执行:
+///   - 线程组1: 遍历所有状态, 调用 GetFrenetStateFromState 转换
+///   - 线程组2: 遍历所有点,   调用 GetFrenetPointFromPoint 转换
+///
+/// 这两个循环互相独立, 但由于 #pragma omp parallel for 的位置,
+/// 实际上它们是顺序执行的, 各自内部使用 4 线程并行。
+///
+/// 注意: GetFrenetStateFromState 在网络查找等步骤中可能有线程安全性问题,
+///       失败时保留原始时间戳以便后续追踪。
 ErrorType SscPlanner::StateTransformUsingOpenMp(
     const vec_E<State>& global_state_vec, const vec_E<Vec2f>& global_point_vec,
     vec_E<FrenetState>* frenet_state_vec, vec_E<Vec2f>* fs_point_vec) const {
   int state_num = global_state_vec.size();
   int point_num = global_point_vec.size();
 
+  // 获取原始数据指针用于 OpenMP 的指针算术访问
   auto ptr_state_vec = frenet_state_vec->data();
   auto ptr_point_vec = fs_point_vec->data();
 
   LOG(WARNING) << "[Ssc]OpenMp - Total number of queries: "
                << state_num + point_num;
-  omp_set_num_threads(4);
+
+  omp_set_num_threads(4);  // 固定使用 4 线程
   {
+    // 状态变换并行区
 #pragma omp parallel for
     for (int i = 0; i < state_num; ++i) {
       FrenetState fs;
       if (kSuccess != stf_.GetFrenetStateFromState(global_state_vec[i], &fs)) {
+        // 转换失败时保留原始时间戳, 避免时间信息丢失
         fs.time_stamp = global_state_vec[i].time_stamp;
       }
       *(ptr_state_vec + i) = fs;
     }
   }
   {
+    // 点变换并行区
 #pragma omp parallel for
     for (int i = 0; i < point_num; ++i) {
       Vec2f fs_pt;
@@ -610,9 +914,14 @@ ErrorType SscPlanner::StateTransformUsingOpenMp(
       *(ptr_point_vec + i) = fs_pt;
     }
   }
+
   return kSuccess;
 }
 
+/// @brief 单线程坐标变换
+///
+/// 顺序遍历所有状态和点执行变换，逻辑与 OpenMP 版本一致。
+/// 适用于对确定性有严格要求的场景。
 ErrorType SscPlanner::StateTransformSingleThread(
     const vec_E<State>& global_state_vec, const vec_E<Vec2f>& global_point_vec,
     vec_E<FrenetState>* frenet_state_vec, vec_E<Vec2f>* fs_point_vec) const {
@@ -620,6 +929,8 @@ ErrorType SscPlanner::StateTransformSingleThread(
   int point_num = global_point_vec.size();
   auto ptr_state_vec = frenet_state_vec->data();
   auto ptr_point_vec = fs_point_vec->data();
+
+  // 顺序转换所有状态
   {
     for (int i = 0; i < state_num; ++i) {
       FrenetState fs;
@@ -627,6 +938,8 @@ ErrorType SscPlanner::StateTransformSingleThread(
       *(ptr_state_vec + i) = fs;
     }
   }
+
+  // 顺序转换所有点
   {
     for (int i = 0; i < point_num; ++i) {
       Vec2f fs_pt;
@@ -634,9 +947,12 @@ ErrorType SscPlanner::StateTransformSingleThread(
       *(ptr_point_vec + i) = fs_pt;
     }
   }
+
   return kSuccess;
 }
 
+/// @brief 设置地图接口
+/// @param map_itf 非空的地图接口指针
 ErrorType SscPlanner::set_map_interface(SscPlannerMapItf* map_itf) {
   if (map_itf == nullptr) return kIllegalInput;
   map_itf_ = map_itf;
@@ -644,12 +960,22 @@ ErrorType SscPlanner::set_map_interface(SscPlannerMapItf* map_itf) {
   return kSuccess;
 }
 
+/// @brief 轨迹验证 (当前默认禁用)
+///
+/// 检查项:
+///   1. 起点位置与初始状态一致 (误差 < 0.1m)
+///   2. 起点速度与初始状态一致 (误差 < 0.1m/s)
+///   3. 全程曲率不超过 0.33 (≈ 最小转弯半径 ~3m)
+///
+/// 此验证较为严格，可能拒绝实际上可执行的轨迹，故默认关闭。
 ErrorType SscPlanner::ValidateTrajectory(const FrenetTrajectory& traj) {
+  // 生成采样时间点序列 (间隔 0.1s)
   std::vector<decimal_t> t_vec_xy;
   common::GetRangeVector<decimal_t>(traj.begin(), traj.end(), 0.1, true,
                                     &t_vec_xy);
   common::State state;
-  // * check init state
+
+  // 检查起点状态
   if (traj.GetState(traj.begin(), &state) != kSuccess) {
     LOG(ERROR) << "[Ssc][Validate]State evaluation error";
     return kWrongStatus;
@@ -664,17 +990,20 @@ ErrorType SscPlanner::ValidateTrajectory(const FrenetTrajectory& traj) {
     LOG(ERROR) << "[Ssc][Validate]Init vel miss match";
     return kWrongStatus;
   }
-  // * check end state
+
+  // 检查终点状态
   if (traj.GetState(traj.end(), &state) != kSuccess) {
     LOG(ERROR) << "[Ssc][Validate]End state eval error";
     return kWrongStatus;
   }
 
+  // 逐采样点检查曲率
   for (const auto t : t_vec_xy) {
     if (traj.GetState(t, &state) != kSuccess) {
       LOG(ERROR) << "[Ssc][Validate]State eval error";
       return kWrongStatus;
     }
+    // 曲率阈值 0.33 ≈ 1/3, 对应最小转弯半径约 3m
     if (fabs(state.curvature) > 0.33) {
       LOG(ERROR) << "[Ssc][Validate]initial_state velocity "
                  << initial_state_.velocity << " Curvature " << state.curvature
@@ -682,6 +1011,7 @@ ErrorType SscPlanner::ValidateTrajectory(const FrenetTrajectory& traj) {
       return kWrongStatus;
     }
   }
+
   return kSuccess;
 }
 

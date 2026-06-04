@@ -1,11 +1,40 @@
+/**
+ * @file ssc_visualizer.cc
+ * @brief SSC 规划器 ROS2 可视化器的实现
+ *
+ * [概述]
+ * SscVisualizer 将 SSC 规划器的内部数据转换为 ROS MarkerArray 消息,
+ * 在 RViz2 中以三维形式呈现。所有可视化以 "ssc_map" 为参考坐标系,
+ * 其中:
+ *   - X 轴 = s (沿车道的纵向位置, 米)
+ *   - Y 轴 = d (横向偏移, 米)
+ *   - Z 轴 = t - start_time_ (相对于规划起始时间的偏移, 秒)
+ *
+ * [可视化内容及话题]
+ *   /vis/agent_{id}/ssc/map_vis            : SSC 三维占据栅格地图
+ *   /vis/agent_{id}/ssc/ego_fs_vis         : 自车在 Frenet 空间的位置和轮廓
+ *   /vis/agent_{id}/ssc/forward_trajs_vis  : 各行为的前向仿真轨迹
+ *   /vis/agent_{id}/ssc/qp_vis             : QP 优化的 Bezier 样条轨迹
+ *   /vis/agent_{id}/ssc/sur_vehicle_trajs_vis : 周围车辆的 Frenet 预测轨迹
+ *   /vis/agent_{id}/ssc/corridor_vis       : 时空走廊 (立方体 + 种子点)
+ *
+ * [Marker 管理]
+ *   每个发布者维护一个 last_*_mk_cnt 计数器, 每次发布时通过
+ *   FillHeaderIdInMarkerArray 从该计数开始递增 Marker ID,
+ *   确保新帧不会残留旧帧的 Marker 片段。
+ */
 #include "ssc_planner/ssc_visualizer.h"
 
 namespace planning {
 
+/// @brief 构造函数: 创建所有 ROS 可视化发布者
+///
+/// 话题名格式: /vis/agent_{node_id}/ssc/{content}_vis
 SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
     : node_(node), node_id_(node_id) {
   std::cout << "node_id_ = " << node_id_ << std::endl;
 
+  // 构造各可视化话题名
   std::string ssc_map_vis_topic = std::string("/vis/agent_") +
                                   std::to_string(node_id_) +
                                   std::string("/ssc/map_vis");
@@ -15,7 +44,7 @@ SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
   std::string forward_trajs_vis_topic = std::string("/vis/agent_") +
                                         std::to_string(node_id_) +
                                         std::string("/ssc/forward_trajs_vis");
-  std::string sur_vehicle_trajs_vis_topic = std::string("/vis/agent_") + 
+  std::string sur_vehicle_trajs_vis_topic = std::string("/vis/agent_") +
                                             std::to_string(node_id_) +
                                             std::string("/ssc/sur_vehicle_trajs_vis");
   std::string corridor_vis_topic = std::string("/vis/agent_") +
@@ -25,6 +54,7 @@ SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
                              std::to_string(node_id_) +
                              std::string("/ssc/qp_vis");
 
+  // 创建发布者 (latch=false, QoS depth=1)
   ssc_map_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(ssc_map_vis_topic, 1);
   qp_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(qp_vis_topic, 1);
   ego_vehicle_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(ego_vehicle_vis_topic, 1);
@@ -33,9 +63,11 @@ SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
   corridor_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(corridor_vis_topic, 1);
 }
 
+/// @brief 主入口: 按顺序发布所有可视化数据
 void SscVisualizer::VisualizeDataWithStamp(const rclcpp::Time &stamp,
                                            const SscPlanner &planner) {
-  start_time_ = planner.time_origin();
+  start_time_ = planner.time_origin();  // 记录时间原点用于计算相对时间
+
   VisualizeSscMap(stamp, planner.p_ssc_map());
   VisualizeEgoVehicleInSscSpace(stamp, planner.fs_ego_vehicle());
   VisualizeForwardTrajectoriesInSscSpace(stamp, planner.forward_trajs_fs(),
@@ -47,29 +79,43 @@ void SscVisualizer::VisualizeDataWithStamp(const rclcpp::Time &stamp,
   VisualizeQpTrajs(stamp, planner.qp_trajs());
 }
 
+/// @brief 可视化 QP 优化的 Bezier 样条轨迹
+///
+/// 将每条 5阶2维 Bezier 样条在 (s, d, t) 空间中绘制为 LINE_STRIP:
+///   - X = s(t) = bezier_spline.evaluate(t, 0)[0]
+///   - Y = d(t) = bezier_spline.evaluate(t, 0)[1]
+///   - Z = t - start_time_ (相对时间)
+///
+/// 采样步长: 0.02s
+/// 颜色: 品红色 (magenta)
 void SscVisualizer::VisualizeQpTrajs(
     const rclcpp::Time &stamp, const vec_E<common::BezierSpline<5, 2>> &trajs) {
   if (trajs.empty()) {
     RCLCPP_WARN(node_->get_logger(), "[SscQP]No valid qp trajs.");
     return;
   }
+
   int id = 0;
   visualization_msgs::msg::MarkerArray traj_mk_arr;
+
   for (int i = 0; i < static_cast<int>(trajs.size()); i++) {
     visualization_msgs::msg::Marker traj_mk;
-    traj_mk.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    traj_mk.type = visualization_msgs::msg::Marker::LINE_STRIP;  // 线带
     traj_mk.action = visualization_msgs::msg::Marker::MODIFY;
     traj_mk.id = id++;
     Vecf<2> pos;
+
+    // 按 0.02s 步长采样 Bezier 样条
     for (decimal_t t = trajs[i].begin(); t < trajs[i].end() + kEPS; t += 0.02) {
       if (trajs[i].evaluate(t, 0, &pos) == kSuccess) {
         geometry_msgs::msg::Point pt;
-        pt.x = pos[0];
-        pt.y = pos[1];
-        pt.z = t - start_time_;
+        pt.x = pos[0];             // s 坐标
+        pt.y = pos[1];             // d 坐标
+        pt.z = t - start_time_;    // 相对时间 → Z 轴
         traj_mk.points.push_back(pt);
       }
     }
+
     common::VisualizationUtil::FillScaleColorInMarker(
         Vec3f(0.2, 0.2, 0.2), common::cmap.at("magenta"), &traj_mk);
     traj_mk_arr.markers.push_back(traj_mk);
@@ -82,27 +128,37 @@ void SscVisualizer::VisualizeQpTrajs(
   last_qp_traj_mk_cnt = num_markers;
 }
 
+/// @brief 可视化 SSC 三维占据栅格地图
+///
+/// 发布两个 Marker:
+///   1. 障碍物占据的体素栅格 (通过 GetRosMarkerCubeListUsingGripMap3D)
+///   2. 参考车道区域边界框 (AxisAlignedBoundingBox):
+///      s 方向范围 = [origin[0] + s_back_len, origin[0] + s_len - s_back_len]
+///      d 方向范围 = [-1.75, 1.75] (标准车道半宽)
+///      颜色: 半透明蓝色
 void SscVisualizer::VisualizeSscMap(const rclcpp::Time &stamp,
                                     const SscMap *p_ssc_map) {
   visualization_msgs::msg::MarkerArray map_marker_arr;
   visualization_msgs::msg::Marker map_marker;
 
+  // 体素栅格: 将 3D 占据栅格转换为立方体列表
   common::VisualizationUtil::GetRosMarkerCubeListUsingGripMap3D(
       p_ssc_map->p_3d_grid(), stamp, "ssc_map", Vec3f(0, 0, 0), &map_marker);
 
+  // 参考车道区域边界框
   auto origin = p_ssc_map->p_3d_grid()->origin();
   decimal_t s_len =
       p_ssc_map->config().map_resolution[0] * p_ssc_map->config().map_size[0];
   decimal_t x = s_len / 2 - p_ssc_map->config().s_back_len + origin[0];
-  decimal_t y = 0;
-  // decimal_t z = t_len / 2;
+  decimal_t y = 0;  // d 方向居中
   std::array<decimal_t, 3> aabb_coord = {x, y, 0};
-  std::array<decimal_t, 3> aabb_len = {s_len, 3.5, 0.01};
+  std::array<decimal_t, 3> aabb_len = {s_len, 3.5, 0.01};  // 3.5m 标准车道全宽
   common::AxisAlignedBoundingBoxND<3> map_aabb(aabb_coord, aabb_len);
   visualization_msgs::msg::Marker map_aabb_marker;
   map_aabb_marker.header.frame_id = "ssc_map";
   map_aabb_marker.header.stamp = stamp;
   map_aabb_marker.id = 1;
+  // 半透明蓝色
   common::VisualizationUtil::GetRosMarkerCubeUsingAxisAlignedBoundingBox3D(
       map_aabb, common::ColorARGB(0.2, 1, 0, 1), &map_aabb_marker);
 
@@ -111,26 +167,36 @@ void SscVisualizer::VisualizeSscMap(const rclcpp::Time &stamp,
   ssc_map_pub_->publish(map_marker_arr);
 }
 
+/// @brief 可视化自车在 SSC 空间中的位置
+///
+/// 发布两个 Marker:
+///   1. 自车轮廓多边形 (LINE_STRIP, 红色半透明)
+///   2. 自车 Frenet 状态位置球体 (SPHERE, 红色)
+///
+/// Z 轴偏移: 使用 dt = fs_ego_vehicle.frenet_state.time_stamp - start_time_
 void SscVisualizer::VisualizeEgoVehicleInSscSpace(
     const rclcpp::Time &stamp, const common::FsVehicle &fs_ego_vehicle) {
   if (fs_ego_vehicle.vertices.empty()) return;
   visualization_msgs::msg::MarkerArray ego_vehicle_mks;
 
+  // 自车轮廓多边形 (LINE_STRIP)
   visualization_msgs::msg::Marker ego_contour_marker;
-  common::ColorARGB color(0.8, 1.0, 0.0, 0.0);
+  common::ColorARGB color(0.8, 1.0, 0.0, 0.0);  // 红色, 80%不透明
   decimal_t dt = fs_ego_vehicle.frenet_state.time_stamp - start_time_;
   vec_E<Vec2f> contour = fs_ego_vehicle.vertices;
-  contour.push_back(contour.front());
+  contour.push_back(contour.front());  // 闭合多边形
   common::VisualizationUtil::GetRosMarkerLineStripUsing2DofVecWithOffsetZ(
       contour, color, Vec3f(0.3, 0.3, 0.3), dt, 0, &ego_contour_marker);
   ego_contour_marker.header.frame_id = "ssc_map";
   ego_contour_marker.header.stamp = stamp;
   ego_vehicle_mks.markers.push_back(ego_contour_marker);
 
+  // 自车状态位置球体
   visualization_msgs::msg::Marker ego_fs_mk;
   common::VisualizationUtil::GetRosMarkerSphereUsingPoint(
-      Vec3f(fs_ego_vehicle.frenet_state.vec_s[0],
-            fs_ego_vehicle.frenet_state.vec_dt[0], dt),
+      Vec3f(fs_ego_vehicle.frenet_state.vec_s[0],   // s 位置
+            fs_ego_vehicle.frenet_state.vec_dt[0],  // d 位置
+            dt),                                     // 相对时间
       common::cmap.at("red"), Vec3f(0.3, 0.3, 0.3), 1, &ego_fs_mk);
   ego_fs_mk.header.frame_id = "ssc_map";
   ego_fs_mk.header.stamp = stamp;
@@ -139,17 +205,29 @@ void SscVisualizer::VisualizeEgoVehicleInSscSpace(
   ego_vehicle_pub_->publish(ego_vehicle_mks);
 }
 
+/// @brief 可视化各行为的前向仿真轨迹
+///
+/// 每条轨迹的每一帧都绘制:
+///   - 车辆轮廓多边形 (LINE_STRIP, 按帧序号渐变着色)
+///   - Frenet 状态位置球体 (SPHERE, 青色)
+///
+/// 颜色使用 Jet colormap: 从蓝色(起点)渐变到红色(终点)
+/// 过滤: 跳过 s <= 0 的帧 (无效数据)
 void SscVisualizer::VisualizeForwardTrajectoriesInSscSpace(
     const rclcpp::Time &stamp, const vec_E<vec_E<common::FsVehicle>> &trajs,
     const SscMap *p_ssc_map) {
   if (trajs.empty()) return;
   visualization_msgs::msg::MarkerArray trajs_markers;
   int id_cnt = 0;
+
   for (int i = 0; i < static_cast<int>(trajs.size()); ++i) {
     if (trajs[i].empty()) continue;
+
     for (int k = 0; k < static_cast<int>(trajs[i].size()); ++k) {
       visualization_msgs::msg::Marker vehicle_marker;
       vec_E<Vec2f> contour = trajs[i][k].vertices;
+
+      // 有效性过滤: 所有顶点的 s 坐标必须 > 0
       bool is_valid = true;
       for (const auto &v : contour) {
         if (v(0) <= 0) {
@@ -157,18 +235,21 @@ void SscVisualizer::VisualizeForwardTrajectoriesInSscSpace(
           break;
         }
       }
-      if (!is_valid) {
-        continue;
-      }
+      if (!is_valid) continue;
+
+      // Jet 渐变着色 (蓝→青→绿→黄→红)
       common::ColorARGB color = common::GetJetColorByValue(
           static_cast<decimal_t>(k),
           static_cast<decimal_t>(trajs[i].size() - 1), 0.0);
-      contour.push_back(contour.front());
+      contour.push_back(contour.front());  // 闭合
       decimal_t dt = trajs[i][k].frenet_state.time_stamp - start_time_;
+
+      // 车辆轮廓
       common::VisualizationUtil::GetRosMarkerLineStripUsing2DofVecWithOffsetZ(
           contour, color, Vec3f(0.1, 0.1, 0.1), dt, id_cnt++, &vehicle_marker);
       trajs_markers.markers.push_back(vehicle_marker);
 
+      // Frenet 状态位置球体 (青色)
       visualization_msgs::msg::Marker fs_mk;
       auto fs = trajs[i][k].frenet_state;
       decimal_t x = fs.vec_s[0];
@@ -187,23 +268,32 @@ void SscVisualizer::VisualizeForwardTrajectoriesInSscSpace(
   last_forward_traj_mk_cnt = num_markers;
 }
 
+/// @brief 可视化周围车辆在 SSC 空间中的预测轨迹
+///
+/// 仅显示第一组行为下的周围车辆轨迹 (trajs_set.front()),
+/// 每帧绘制车辆轮廓多边形 (LINE_STRIP, Jet 渐变着色)。
+/// 过滤: 跳过无效帧 (s <= 0)
 void SscVisualizer::VisualizeSurroundingVehicleTrajInSscSpace(
     const rclcpp::Time &stamp,
     const vec_E<std::unordered_map<int, vec_E<common::FsVehicle>>> &trajs_set,
     const SscMap *p_ssc_map) {
   visualization_msgs::msg::MarkerArray trajs_markers;
   if (!trajs_set.empty()) {
-    auto trajs = trajs_set.front();
+    auto trajs = trajs_set.front();  // 仅显示第一组行为
     if (!trajs.empty()) {
       int id_cnt = 0;
+      // 遍历每辆周围车辆
       for (auto it = trajs.begin(); it != trajs.end(); ++it) {
         if (it->second.empty()) continue;
+        // 遍历该车的每一帧
         for (int k = 0; k < static_cast<int>(it->second.size()); ++k) {
           visualization_msgs::msg::Marker vehicle_marker;
           common::ColorARGB color = common::GetJetColorByValue(
               static_cast<decimal_t>(k),
               static_cast<decimal_t>(it->second.size() - 1), 0.0);
           vec_E<Vec2f> contour = it->second[k].vertices;
+
+          // 有效帧过滤
           bool is_valid = true;
           for (const auto &v : contour) {
             if (v(0) <= 0) {
@@ -211,9 +301,8 @@ void SscVisualizer::VisualizeSurroundingVehicleTrajInSscSpace(
               break;
             }
           }
-          if (!is_valid) {
-            continue;
-          }
+          if (!is_valid) continue;
+
           contour.push_back(contour.front());
           decimal_t dt = it->second[k].frenet_state.time_stamp - start_time_;
           common::VisualizationUtil::
@@ -236,32 +325,41 @@ void SscVisualizer::VisualizeSurroundingVehicleTrajInSscSpace(
   last_sur_vehicle_traj_mk_cnt = num_markers;
 }
 
+/// @brief 可视化时空走廊
+///
+/// 对每个走廊的每个立方体:
+///   1. 种子点可视化: 将栅格坐标转为物理坐标, 绘制为球体 (SPHERE, Jet渐变)
+///   2. 立方体可视化: 将栅格坐标转为物理坐标, 绘制为半透明立方体 (CUBE)
+///      s 对应 X 轴, d 对应 Y 轴, t-start_time_ 对应 Z 轴
 void SscVisualizer::VisualizeCorridorsInSscSpace(
     const rclcpp::Time &stamp, const vec_E<common::DrivingCorridor> corridor_vec,
     const SscMap *p_ssc_map) {
   if (corridor_vec.empty()) return;
   visualization_msgs::msg::MarkerArray corridor_vec_marker;
   int id_cnt = 0;
+
   for (const auto &corridor : corridor_vec) {
     int cube_cnt = 0;
     for (const auto &driving_cube : corridor.cubes) {
+      // Jet 渐变着色 (基于立方体序号)
       common::ColorARGB color = common::GetJetColorByValue(
           cube_cnt, corridor.cubes.size() - 1, -kEPS);
+
+      // 种子点球体
       for (const auto &seed : driving_cube.seeds) {
         visualization_msgs::msg::Marker seed_marker;
         decimal_t s_x, s_y, s_z;
-        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(0), 0,
-                                                                     &s_x);
-        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(1), 1,
-                                                                     &s_y);
-        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(2), 2,
-                                                                     &s_z);
+        // 从栅格索引转为物理坐标
+        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(0), 0, &s_x);
+        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(1), 1, &s_y);
+        p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(seed(2), 2, &s_z);
         common::VisualizationUtil::GetRosMarkerSphereUsingPoint(
             Vec3f(s_x, s_y, s_z - start_time_), color, Vec3f(0.3, 0.3, 0.3),
             id_cnt++, &seed_marker);
         corridor_vec_marker.markers.push_back(seed_marker);
       }
 
+      // 立方体: 半透明绿色
       decimal_t x_max, x_min;
       decimal_t y_max, y_min;
       decimal_t z_max, z_min;
@@ -277,6 +375,8 @@ void SscVisualizer::VisualizeCorridorsInSscSpace(
           driving_cube.cube.upper_bound[2], 2, &z_max);
       p_ssc_map->p_3d_grid()->GetGlobalMetricUsingCoordOnSingleDim(
           driving_cube.cube.lower_bound[2], 2, &z_min);
+
+      // 计算立方体中心和尺寸
       decimal_t dx = x_max - x_min;
       decimal_t dy = y_max - y_min;
       decimal_t dz = z_max - z_min;
@@ -289,6 +389,7 @@ void SscVisualizer::VisualizeCorridorsInSscSpace(
       common::AxisAlignedBoundingBoxND<3> map_aabb(aabb_coord, aabb_len);
       visualization_msgs::msg::Marker map_aabb_marker;
       map_aabb_marker.id = id_cnt++;
+      // 半透明绿色: ARGB(0.15, 0.3, 1.0, 0.3)
       common::VisualizationUtil::GetRosMarkerCubeUsingAxisAlignedBoundingBox3D(
           map_aabb, common::ColorARGB(0.15, 0.3, 1.0, 0.3), &map_aabb_marker);
       corridor_vec_marker.markers.push_back(map_aabb_marker);
