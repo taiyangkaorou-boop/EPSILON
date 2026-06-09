@@ -442,6 +442,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="",
         help="实验对应的 commit 或 tag，用于论文数据追溯。",
     )
+    parser.add_argument(
+        "--scripted-risk-actors-enabled",
+        action="store_true",
+        help="记录本实验是否启用了 MVP-16 脚本化周车。",
+    )
+    parser.add_argument(
+        "--scripted-risk-actor-count",
+        type=int,
+        default=0,
+        help="记录脚本化周车数量。",
+    )
+    parser.add_argument(
+        "--risk-actor-script-path",
+        default="",
+        help="记录脚本化周车 JSON 路径，便于论文实验追溯。",
+    )
     return parser
 
 
@@ -458,6 +474,9 @@ def main() -> int:
         "git_ref": args.git_ref,
         "risk_grid_csv": str(Path(args.risk_grid_csv)),
         "risk_exposure_csv": str(Path(args.risk_exposure_csv)),
+        "scripted_risk_actors_enabled": int(args.scripted_risk_actors_enabled),
+        "scripted_risk_actor_count": args.scripted_risk_actor_count,
+        "risk_actor_script_path": args.risk_actor_script_path,
     }
     summary.update(summarize_risk_grid(risk_grid_rows))
     summary.update(summarize_exposure(risk_exposure_rows))

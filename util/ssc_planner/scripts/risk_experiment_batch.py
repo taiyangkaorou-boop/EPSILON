@@ -49,7 +49,19 @@ class ExperimentResult:
     risk_grid_present: bool
     risk_exposure_present: bool
     timed_out: bool
+    scripted_risk_actors_enabled: bool
+    scripted_risk_actor_count: int
+    risk_actor_script_path: str
     status: str
+
+
+@dataclass(frozen=True)
+class ScriptedRiskActorMetadata:
+    """脚本化周车元数据，贯穿 manifest、summary 和 matrix。"""
+
+    enabled: bool
+    actor_count: int
+    script_path: Path
 
 
 def repo_root_from_script() -> Path:
@@ -80,6 +92,28 @@ def default_experiments(config_dir: Path) -> List[ExperimentSpec]:
         ExperimentSpec("corridor", config_dir / "ssc_config_risk_corridor.pb.txt"),
         ExperimentSpec("full", config_dir / "ssc_config_risk_full.pb.txt"),
     ]
+
+
+def count_scripted_risk_actors(script_path: Path) -> int:
+    """读取 risk_actor_script.json 中的 actor 数量；不存在时返回 0。"""
+    if not script_path.exists():
+        return 0
+    data = json.loads(script_path.read_text(encoding="utf-8"))
+    actors = data.get("actors", [])
+    if not isinstance(actors, list):
+        raise ValueError(f"risk actor script actors must be a list: {script_path}")
+    return len(actors)
+
+
+def scripted_risk_actor_metadata(args: argparse.Namespace) -> ScriptedRiskActorMetadata:
+    """根据命令行参数和 playground 默认脚本推导脚本化周车元数据。"""
+    default_script_path = (
+        args.repo_root / "core" / "playgrounds" / args.playground / "risk_actor_script.json"
+    )
+    script_path = args.risk_actor_script_path or default_script_path
+    actor_count = count_scripted_risk_actors(script_path)
+    enabled = args.enable_scripted_risk_actors or actor_count > 0
+    return ScriptedRiskActorMetadata(enabled, actor_count, script_path)
 
 
 def parse_experiment_item(item: str, config_dir: Path) -> ExperimentSpec:
@@ -144,14 +178,7 @@ def command_context(
         if args.planner_backend == "mpdm"
         else "test_ssc_with_eudm_ros_launch.py"
     )
-    # MVP-16: playground 自带 risk_actor_script.json 时自动启用脚本化周车。
-    default_script_path = (
-        args.repo_root / "core" / "playgrounds" / args.playground / "risk_actor_script.json"
-    )
-    risk_actor_script_path = args.risk_actor_script_path or default_script_path
-    enable_scripted_risk_actors = (
-        args.enable_scripted_risk_actors or risk_actor_script_path.exists()
-    )
+    risk_actor_metadata = scripted_risk_actor_metadata(args)
     return {
         "experiment_name": experiment.name,
         "scenario_name": args.scenario_name,
@@ -165,8 +192,9 @@ def command_context(
         "risk_exposure_csv": str(args.risk_exposure_csv),
         "output_dir": str(output_dir),
         "setup_bash": str(args.setup_bash),
-        "enable_scripted_risk_actors": "true" if enable_scripted_risk_actors else "false",
-        "risk_actor_script_path": str(risk_actor_script_path),
+        "enable_scripted_risk_actors": "true" if risk_actor_metadata.enabled else "false",
+        "risk_actor_script_path": str(risk_actor_metadata.script_path),
+        "scripted_risk_actor_count": str(risk_actor_metadata.actor_count),
         "risk_actor_publish_rate_hz": str(args.risk_actor_publish_rate_hz),
     }
 
@@ -282,6 +310,15 @@ def summarize_experiment(
         "--git-ref",
         args.git_ref or git_reference,
     ]
+    risk_actor_metadata = scripted_risk_actor_metadata(args)
+    if risk_actor_metadata.enabled:
+        command.append("--scripted-risk-actors-enabled")
+    command.extend([
+        "--scripted-risk-actor-count",
+        str(risk_actor_metadata.actor_count),
+        "--risk-actor-script-path",
+        str(risk_actor_metadata.script_path),
+    ])
     return_code = run_python_command(command, repo_root, output_dir / "report.log")
     if return_code != 0:
         raise RuntimeError(f"risk_experiment_report.py failed for {experiment.name}")
@@ -426,6 +463,7 @@ def main() -> int:
             raise FileNotFoundError(f"config not found: {experiment.config_path}")
 
     git_reference = args.git_ref or git_ref(repo_root)
+    risk_actor_metadata = scripted_risk_actor_metadata(args)
     results: List[ExperimentResult] = []
     dry_run_commands: List[str] = []
     had_error = False
@@ -450,6 +488,9 @@ def main() -> int:
                     risk_grid_present=False,
                     risk_exposure_present=False,
                     timed_out=False,
+                    scripted_risk_actors_enabled=risk_actor_metadata.enabled,
+                    scripted_risk_actor_count=risk_actor_metadata.actor_count,
+                    risk_actor_script_path=str(risk_actor_metadata.script_path),
                     status="dry_run",
                 )
             )
@@ -496,6 +537,9 @@ def main() -> int:
                 risk_grid_present=risk_grid_present,
                 risk_exposure_present=risk_exposure_present,
                 timed_out=timed_out,
+                scripted_risk_actors_enabled=risk_actor_metadata.enabled,
+                scripted_risk_actor_count=risk_actor_metadata.actor_count,
+                risk_actor_script_path=str(risk_actor_metadata.script_path),
                 status=status,
             )
         )
@@ -534,6 +578,9 @@ def main() -> int:
         "planner_backend": args.planner_backend,
         "repo_root": str(repo_root),
         "setup_bash": str(args.setup_bash),
+        "scripted_risk_actors_enabled": risk_actor_metadata.enabled,
+        "scripted_risk_actor_count": risk_actor_metadata.actor_count,
+        "risk_actor_script_path": str(risk_actor_metadata.script_path),
         "output_root": str(output_root),
         "run_plan": str(plan_path),
         "matrix_command": matrix_command,
