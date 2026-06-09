@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TextIO
 
 import rclpy
 from rclpy.node import Node
@@ -53,6 +54,17 @@ class IdmFollowConfig:
 
 
 @dataclass(frozen=True)
+class IdmTelemetry:
+    """保存单次 IDM 计算的中间量，供实验 CSV 复现闭环交互过程。"""
+
+    target_vehicle_id: int
+    gap: float
+    relative_velocity: float
+    desired_gap: float
+    acceleration: float
+
+
+@dataclass(frozen=True)
 class ScriptedActor:
     """单辆脚本化风险周车的完整控制配置。"""
 
@@ -62,6 +74,45 @@ class ScriptedActor:
     initial_state: ActorInitialState
     segments: List[ActorSegment]
     idm_follow: Optional[IdmFollowConfig]
+
+
+TELEMETRY_FIELDS = [
+    "stamp",
+    "elapsed",
+    "actor_id",
+    "mode",
+    "target_vehicle_id",
+    "current_x",
+    "current_y",
+    "current_angle",
+    "current_velocity",
+    "current_acceleration",
+    "script_lateral",
+    "script_heading_delta",
+    "gap",
+    "relative_velocity",
+    "desired_gap",
+    "idm_acceleration",
+    "command_x",
+    "command_y",
+    "command_angle",
+    "command_velocity",
+    "command_acceleration",
+]
+
+
+def parse_bool_param(value: object) -> bool:
+    """兼容 ROS launch 字符串和原生 bool 参数，统一解析布尔开关。"""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def csv_float(value: Optional[float]) -> str:
+    """把浮点数格式化为稳定 CSV 字段；None 表示本行无该物理量。"""
+    if value is None:
+        return ""
+    return f"{value:.6f}"
 
 
 def smoothstep(ratio: float) -> float:
@@ -139,11 +190,19 @@ class ScriptedRiskActorNode(Node):
         self.declare_parameter("vehicle_info_path", "")
         self.declare_parameter("publish_rate_hz", 50.0)
         self.declare_parameter("arena_info_dynamic_topic", "/arena_info_dynamic")
+        self.declare_parameter("telemetry_csv_enabled", True)
+        self.declare_parameter(
+            "telemetry_csv_path", "/tmp/epsilon_scripted_risk_actor_telemetry.csv"
+        )
 
         script_path = Path(self.get_parameter("script_path").value)
         vehicle_info_path = Path(self.get_parameter("vehicle_info_path").value)
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         arena_info_dynamic_topic = str(self.get_parameter("arena_info_dynamic_topic").value)
+        telemetry_csv_enabled = parse_bool_param(
+            self.get_parameter("telemetry_csv_enabled").value
+        )
+        telemetry_csv_path = Path(str(self.get_parameter("telemetry_csv_path").value))
         if publish_rate_hz <= 0.0:
             raise ValueError("publish_rate_hz must be positive")
         if not script_path.exists():
@@ -167,11 +226,47 @@ class ScriptedRiskActorNode(Node):
         self.last_publish_elapsed_: Dict[int, float] = {}
         self.last_script_lateral_: Dict[int, float] = {}
         self.last_script_heading_: Dict[int, float] = {}
+        self.telemetry_csv_enabled_ = telemetry_csv_enabled
+        self.telemetry_csv_path_ = telemetry_csv_path
+        self.telemetry_csv_file_: Optional[TextIO] = None
+        self.telemetry_csv_writer_: Optional[csv.DictWriter] = None
+        self.open_telemetry_csv_if_needed()
         self.start_time_ = self.get_clock().now()
         self.timer_ = self.create_timer(1.0 / publish_rate_hz, self.on_timer)
         self.get_logger().info(
             f"loaded {len(self.actors_)} scripted risk actors from {script_path}"
         )
+        if self.telemetry_csv_enabled_:
+            self.get_logger().info(
+                f"scripted risk actor telemetry csv: {self.telemetry_csv_path_}"
+            )
+
+    def open_telemetry_csv_if_needed(self) -> None:
+        """按需打开 telemetry CSV，并立即写 header，保证 timeout 退出也能留下表头。"""
+        if not self.telemetry_csv_enabled_:
+            return
+        if not str(self.telemetry_csv_path_):
+            self.get_logger().warn("telemetry_csv_path is empty; telemetry disabled")
+            self.telemetry_csv_enabled_ = False
+            return
+        self.telemetry_csv_path_.parent.mkdir(parents=True, exist_ok=True)
+        self.telemetry_csv_file_ = self.telemetry_csv_path_.open(
+            "w", newline="", encoding="utf-8"
+        )
+        self.telemetry_csv_writer_ = csv.DictWriter(
+            self.telemetry_csv_file_, fieldnames=TELEMETRY_FIELDS
+        )
+        self.telemetry_csv_writer_.writeheader()
+        self.telemetry_csv_file_.flush()
+
+    def close_telemetry_csv(self) -> None:
+        """关闭 telemetry CSV，配合批量实验的 timeout 尽量减少数据丢失。"""
+        if self.telemetry_csv_file_ is None:
+            return
+        self.telemetry_csv_file_.flush()
+        self.telemetry_csv_file_.close()
+        self.telemetry_csv_file_ = None
+        self.telemetry_csv_writer_ = None
 
     def load_script(
         self, script_path: Path, initial_states: Dict[int, ActorInitialState]
@@ -250,8 +345,8 @@ class ScriptedRiskActorNode(Node):
             longitudinal += velocity * max(0.0, elapsed - cursor_time)
         return longitudinal, lateral, velocity, acceleration, heading_delta
 
-    def idm_acceleration(self, actor: ScriptedActor) -> Optional[float]:
-        """根据最新动态场景计算 IDM 纵向加速度；状态不足时返回 None。"""
+    def compute_idm_telemetry(self, actor: ScriptedActor) -> Optional[IdmTelemetry]:
+        """根据最新动态场景计算 IDM 纵向加速度和中间量；状态不足时返回 None。"""
         config = actor.idm_follow
         if config is None:
             return None
@@ -266,7 +361,13 @@ class ScriptedRiskActorNode(Node):
         dy = target_state.y - ego_state.y
         gap = dx * heading_x + dy * heading_y
         if gap <= 0.1:
-            return -config.comfortable_brake
+            return IdmTelemetry(
+                target_vehicle_id=config.target_vehicle_id,
+                gap=gap,
+                relative_velocity=ego_state.velocity - target_state.velocity,
+                desired_gap=config.min_gap,
+                acceleration=-config.comfortable_brake,
+            )
 
         relative_velocity = ego_state.velocity - target_state.velocity
         desired_velocity = max(0.1, config.desired_velocity)
@@ -279,9 +380,18 @@ class ScriptedRiskActorNode(Node):
         free_road_term = (ego_state.velocity / desired_velocity) ** config.delta
         interaction_term = (desired_gap / max(0.1, gap)) ** 2
         acc = config.max_acc * (1.0 - free_road_term - interaction_term)
-        return min(config.max_acc, max(-config.comfortable_brake, acc))
+        acceleration = min(config.max_acc, max(-config.comfortable_brake, acc))
+        return IdmTelemetry(
+            target_vehicle_id=config.target_vehicle_id,
+            gap=gap,
+            relative_velocity=relative_velocity,
+            desired_gap=desired_gap,
+            acceleration=acceleration,
+        )
 
-    def build_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+    def build_signal(
+        self, actor: ScriptedActor, elapsed: float
+    ) -> tuple[ControlSignal, Dict[str, str]]:
         """根据当前时间生成开环状态消息，交给 phy_simulator 直接覆盖周车状态。"""
         if actor.mode == "open_loop":
             return self.build_open_loop_signal(actor, elapsed)
@@ -297,7 +407,63 @@ class ScriptedRiskActorNode(Node):
         msg.is_openloop.data = True
         return msg
 
-    def build_open_loop_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+    def telemetry_row(
+        self,
+        actor: ScriptedActor,
+        elapsed: float,
+        current: ActorInitialState,
+        msg: ControlSignal,
+        script_lateral: float,
+        script_heading_delta: float,
+        idm_telemetry: Optional[IdmTelemetry],
+    ) -> Dict[str, str]:
+        """把单次控制输出和闭环中间量整理成一行 CSV。"""
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1.0e-9
+        target_vehicle_id = ""
+        if actor.idm_follow is not None:
+            target_vehicle_id = str(actor.idm_follow.target_vehicle_id)
+        if idm_telemetry is not None:
+            target_vehicle_id = str(idm_telemetry.target_vehicle_id)
+        return {
+            "stamp": csv_float(stamp),
+            "elapsed": csv_float(elapsed),
+            "actor_id": str(actor.actor_id),
+            "mode": actor.mode,
+            "target_vehicle_id": target_vehicle_id,
+            "current_x": csv_float(current.x),
+            "current_y": csv_float(current.y),
+            "current_angle": csv_float(current.angle),
+            "current_velocity": csv_float(current.velocity),
+            "current_acceleration": csv_float(current.acceleration),
+            "script_lateral": csv_float(script_lateral),
+            "script_heading_delta": csv_float(script_heading_delta),
+            "gap": csv_float(None if idm_telemetry is None else idm_telemetry.gap),
+            "relative_velocity": csv_float(
+                None if idm_telemetry is None else idm_telemetry.relative_velocity
+            ),
+            "desired_gap": csv_float(
+                None if idm_telemetry is None else idm_telemetry.desired_gap
+            ),
+            "idm_acceleration": csv_float(
+                None if idm_telemetry is None else idm_telemetry.acceleration
+            ),
+            "command_x": csv_float(float(msg.state.vec_position.x)),
+            "command_y": csv_float(float(msg.state.vec_position.y)),
+            "command_angle": csv_float(float(msg.state.angle)),
+            "command_velocity": csv_float(float(msg.state.velocity)),
+            "command_acceleration": csv_float(float(msg.state.acceleration)),
+        }
+
+    def append_telemetry(self, row: Dict[str, str]) -> None:
+        """写入一行 telemetry，并逐行 flush，适配短时 timeout 实验。"""
+        if self.telemetry_csv_writer_ is None or self.telemetry_csv_file_ is None:
+            return
+        self.telemetry_csv_writer_.writerow(row)
+        self.telemetry_csv_file_.flush()
+
+    def build_open_loop_signal(
+        self, actor: ScriptedActor, elapsed: float
+    ) -> tuple[ControlSignal, Dict[str, str]]:
         """沿用 MVP-16 的开环脚本轨迹生成方式，保证旧场景完全兼容。"""
         initial = actor.initial_state
         msg = self.new_control_signal()
@@ -314,9 +480,14 @@ class ScriptedRiskActorNode(Node):
         msg.state.velocity = velocity
         msg.state.acceleration = acceleration
         msg.state.steer = initial.steer
-        return msg
+        telemetry = self.telemetry_row(
+            actor, elapsed, initial, msg, lateral, heading_delta, None
+        )
+        return msg, telemetry
 
-    def build_idm_follow_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+    def build_idm_follow_signal(
+        self, actor: ScriptedActor, elapsed: float
+    ) -> tuple[ControlSignal, Dict[str, str]]:
         """基于最新 arena_info_dynamic 做 IDM 纵向闭环，并叠加脚本横向偏移。"""
         current = self.latest_vehicle_states_.get(actor.actor_id, actor.initial_state)
         previous_elapsed = self.last_publish_elapsed_.get(actor.actor_id, elapsed)
@@ -330,8 +501,10 @@ class ScriptedRiskActorNode(Node):
         self.last_script_lateral_[actor.actor_id] = lateral
         self.last_script_heading_[actor.actor_id] = heading_delta
 
-        idm_acc = self.idm_acceleration(actor)
-        acceleration = scripted_acceleration if idm_acc is None else idm_acc
+        idm_telemetry = self.compute_idm_telemetry(actor)
+        acceleration = (
+            scripted_acceleration if idm_telemetry is None else idm_telemetry.acceleration
+        )
         velocity = max(0.0, current.velocity + acceleration * dt)
         average_velocity = 0.5 * (current.velocity + velocity)
 
@@ -352,13 +525,18 @@ class ScriptedRiskActorNode(Node):
         msg.state.velocity = velocity
         msg.state.acceleration = acceleration
         msg.state.steer = current.steer
-        return msg
+        telemetry = self.telemetry_row(
+            actor, elapsed, current, msg, lateral, heading_delta, idm_telemetry
+        )
+        return msg, telemetry
 
     def on_timer(self) -> None:
         """定时发布所有脚本 actor 的开环控制信号。"""
         elapsed = (self.get_clock().now() - self.start_time_).nanoseconds * 1.0e-9
         for actor in self.actors_:
-            self.publishers_[actor.actor_id].publish(self.build_signal(actor, elapsed))
+            msg, telemetry = self.build_signal(actor, elapsed)
+            self.publishers_[actor.actor_id].publish(msg)
+            self.append_telemetry(telemetry)
 
 
 def main() -> None:
@@ -368,6 +546,7 @@ def main() -> None:
     try:
         rclpy.spin(node)
     finally:
+        node.close_telemetry_csv()
         node.destroy_node()
         rclpy.shutdown()
 

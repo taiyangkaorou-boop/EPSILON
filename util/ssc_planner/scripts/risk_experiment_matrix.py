@@ -21,6 +21,13 @@ SummaryRow = Dict[str, str]
 DEFAULT_METRICS = [
     "scripted_risk_actors_enabled",
     "scripted_risk_actor_count",
+    "scripted_actor_telemetry_rows",
+    "scripted_actor_telemetry_actor_count",
+    "scripted_actor_telemetry_idm_rows",
+    "scripted_actor_gap_min",
+    "scripted_actor_idm_acceleration_min",
+    "scripted_actor_command_acceleration_min",
+    "scripted_actor_command_acceleration_max",
     "risk_grid_rows",
     "sum_risk_mean",
     "max_risk_max",

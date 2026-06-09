@@ -376,6 +376,40 @@ def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
     return summary
 
 
+def summarize_scripted_actor_telemetry(
+    rows: List[Dict[str, str]]
+) -> Dict[str, SummaryValue]:
+    """汇总脚本化周车 telemetry，证明主动交互 actor 的运行过程可追溯。"""
+    actor_ids = sorted({row.get("actor_id", "").strip() for row in rows if row.get("actor_id")})
+    modes = sorted({row.get("mode", "").strip() for row in rows if row.get("mode")})
+    idm_rows = [
+        row
+        for row in rows
+        if row.get("mode", "").strip() == "idm_follow"
+        or parse_float(row.get("idm_acceleration", "")) is not None
+    ]
+    summary: Dict[str, SummaryValue] = {
+        "scripted_actor_telemetry_rows": len(rows),
+        "scripted_actor_telemetry_actor_count": len(actor_ids),
+        "scripted_actor_telemetry_actor_ids": ",".join(actor_ids),
+        "scripted_actor_telemetry_modes": ",".join(modes),
+        "scripted_actor_telemetry_idm_rows": len(idm_rows),
+    }
+
+    for metric_name, field in [
+        ("scripted_actor_gap", "gap"),
+        ("scripted_actor_relative_velocity", "relative_velocity"),
+        ("scripted_actor_desired_gap", "desired_gap"),
+        ("scripted_actor_idm_acceleration", "idm_acceleration"),
+        ("scripted_actor_command_velocity", "command_velocity"),
+        ("scripted_actor_command_acceleration", "command_acceleration"),
+    ]:
+        field_values = values(rows, field)
+        summary.update(summarize_value_list(metric_name, field_values))
+        summary[f"{metric_name}_min"] = min(field_values) if field_values else None
+    return summary
+
+
 def write_summary_csv(summary: Dict[str, SummaryValue], output_path: Path) -> None:
     """将 summary 写成两列表格，便于论文表格或电子表格读取。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +457,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="MVP-6/7/8 候选轨迹 risk exposure CSV 路径。",
     )
     parser.add_argument(
+        "--scripted-actor-telemetry-csv",
+        default="/tmp/epsilon_scripted_risk_actor_telemetry.csv",
+        help="MVP-19 脚本化周车 telemetry CSV 路径。",
+    )
+    parser.add_argument(
         "--output-dir",
         default="/tmp/epsilon_risk_experiment_report",
         help="summary CSV/JSON 和可选趋势图输出目录。",
@@ -467,6 +506,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     risk_grid_rows = read_csv(Path(args.risk_grid_csv))
     risk_exposure_rows = read_csv(Path(args.risk_exposure_csv))
+    scripted_actor_telemetry_rows = read_csv(Path(args.scripted_actor_telemetry_csv))
 
     summary: Dict[str, SummaryValue] = {
         "experiment_name": args.experiment_name,
@@ -474,12 +514,14 @@ def main() -> int:
         "git_ref": args.git_ref,
         "risk_grid_csv": str(Path(args.risk_grid_csv)),
         "risk_exposure_csv": str(Path(args.risk_exposure_csv)),
+        "scripted_actor_telemetry_csv": str(Path(args.scripted_actor_telemetry_csv)),
         "scripted_risk_actors_enabled": int(args.scripted_risk_actors_enabled),
         "scripted_risk_actor_count": args.scripted_risk_actor_count,
         "risk_actor_script_path": args.risk_actor_script_path,
     }
     summary.update(summarize_risk_grid(risk_grid_rows))
     summary.update(summarize_exposure(risk_exposure_rows))
+    summary.update(summarize_scripted_actor_telemetry(scripted_actor_telemetry_rows))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_summary_csv(summary, output_dir / "summary.csv")
@@ -490,6 +532,12 @@ def main() -> int:
     plot_series(risk_grid_rows, "nonzero_cells", output_dir / "risk_grid_nonzero.png")
     plot_series(risk_exposure_rows, "exposure_max", output_dir / "trajectory_exposure_max.png")
     plot_series(risk_exposure_rows, "risk_score", output_dir / "trajectory_risk_score.png")
+    plot_series(scripted_actor_telemetry_rows, "gap", output_dir / "scripted_actor_gap.png")
+    plot_series(
+        scripted_actor_telemetry_rows,
+        "command_acceleration",
+        output_dir / "scripted_actor_command_acceleration.png",
+    )
 
     print(f"summary_csv={output_dir / 'summary.csv'}")
     print(f"summary_json={output_dir / 'summary.json'}")

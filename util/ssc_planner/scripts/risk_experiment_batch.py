@@ -23,6 +23,9 @@ from typing import Dict, Iterable, List, Optional
 
 DEFAULT_RISK_GRID_CSV = Path("/tmp/epsilon_risk_grid_stats.csv")
 DEFAULT_RISK_EXPOSURE_CSV = Path("/tmp/epsilon_mvp6_risk_exposure.csv")
+DEFAULT_SCRIPTED_ACTOR_TELEMETRY_CSV = Path(
+    "/tmp/epsilon_scripted_risk_actor_telemetry.csv"
+)
 TIMEOUT_RETURN_CODE = 124
 
 
@@ -46,8 +49,10 @@ class ExperimentResult:
     summary_csv: str
     risk_grid_archive: str
     risk_exposure_archive: str
+    scripted_actor_telemetry_archive: str
     risk_grid_present: bool
     risk_exposure_present: bool
+    scripted_actor_telemetry_present: bool
     timed_out: bool
     scripted_risk_actors_enabled: bool
     scripted_risk_actor_count: int
@@ -190,6 +195,7 @@ def command_context(
         "duration_sec": str(args.duration_sec),
         "risk_grid_csv": str(args.risk_grid_csv),
         "risk_exposure_csv": str(args.risk_exposure_csv),
+        "scripted_actor_telemetry_csv": str(args.scripted_actor_telemetry_csv),
         "output_dir": str(output_dir),
         "setup_bash": str(args.setup_bash),
         "enable_scripted_risk_actors": "true" if risk_actor_metadata.enabled else "false",
@@ -210,6 +216,7 @@ def default_run_command(context: Dict[str, str]) -> str:
     enable_scripted_risk_actors = shlex.quote(context["enable_scripted_risk_actors"])
     risk_actor_script_path = shlex.quote(context["risk_actor_script_path"])
     risk_actor_publish_rate_hz = shlex.quote(context["risk_actor_publish_rate_hz"])
+    scripted_actor_telemetry_csv = shlex.quote(context["scripted_actor_telemetry_csv"])
     return (
         f"source {setup_bash} && "
         f"timeout {duration_sec}s ros2 launch planning_integrated {launch_file} "
@@ -217,7 +224,9 @@ def default_run_command(context: Dict[str, str]) -> str:
         f"ssc_config_path:={config_path} "
         f"enable_scripted_risk_actors:={enable_scripted_risk_actors} "
         f"risk_actor_script_path:={risk_actor_script_path} "
-        f"risk_actor_publish_rate_hz:={risk_actor_publish_rate_hz}"
+        f"risk_actor_publish_rate_hz:={risk_actor_publish_rate_hz} "
+        f"scripted_actor_telemetry_enabled:=true "
+        f"scripted_actor_telemetry_csv:={scripted_actor_telemetry_csv}"
     )
 
 
@@ -301,6 +310,8 @@ def summarize_experiment(
         str(output_dir / "raw_risk_grid_stats.csv"),
         "--risk-exposure-csv",
         str(output_dir / "raw_risk_exposure.csv"),
+        "--scripted-actor-telemetry-csv",
+        str(output_dir / "raw_scripted_actor_telemetry.csv"),
         "--output-dir",
         str(summary_dir),
         "--experiment-name",
@@ -415,6 +426,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="运行时 risk exposure CSV 路径。",
     )
     parser.add_argument(
+        "--scripted-actor-telemetry-csv",
+        type=Path,
+        default=DEFAULT_SCRIPTED_ACTOR_TELEMETRY_CSV,
+        help="运行时脚本化周车 telemetry CSV 路径。",
+    )
+    parser.add_argument(
         "--git-ref",
         default="",
         help="写入 summary 的代码版本；默认自动读取当前 git short hash。",
@@ -485,8 +502,12 @@ def main() -> int:
                     summary_csv=str(experiment_dir / "report" / "summary.csv"),
                     risk_grid_archive=str(experiment_dir / "raw_risk_grid_stats.csv"),
                     risk_exposure_archive=str(experiment_dir / "raw_risk_exposure.csv"),
+                    scripted_actor_telemetry_archive=str(
+                        experiment_dir / "raw_scripted_actor_telemetry.csv"
+                    ),
                     risk_grid_present=False,
                     risk_exposure_present=False,
+                    scripted_actor_telemetry_present=False,
                     timed_out=False,
                     scripted_risk_actors_enabled=risk_actor_metadata.enabled,
                     scripted_risk_actor_count=risk_actor_metadata.actor_count,
@@ -498,6 +519,7 @@ def main() -> int:
 
         remove_file_if_exists(args.risk_grid_csv)
         remove_file_if_exists(args.risk_exposure_csv)
+        remove_file_if_exists(args.scripted_actor_telemetry_csv)
         return_code = run_shell_command(run_command, repo_root, experiment_dir / "run.log")
         risk_grid_present = archive_csv(
             args.risk_grid_csv, experiment_dir / "raw_risk_grid_stats.csv"
@@ -505,12 +527,23 @@ def main() -> int:
         risk_exposure_present = archive_csv(
             args.risk_exposure_csv, experiment_dir / "raw_risk_exposure.csv"
         )
+        scripted_actor_telemetry_present = archive_csv(
+            args.scripted_actor_telemetry_csv,
+            experiment_dir / "raw_scripted_actor_telemetry.csv",
+        )
 
         timed_out = return_code == TIMEOUT_RETURN_CODE
         command_completed = return_code == 0 or timed_out
         status = "ok" if command_completed else "run_failed"
         summary_csv = experiment_dir / "report" / "summary.csv"
         if command_completed and not risk_grid_present:
+            status = "data_missing"
+            had_error = True
+        elif (
+            command_completed
+            and risk_actor_metadata.enabled
+            and not scripted_actor_telemetry_present
+        ):
             status = "data_missing"
             had_error = True
         elif command_completed:
@@ -534,8 +567,12 @@ def main() -> int:
                 summary_csv=str(summary_csv),
                 risk_grid_archive=str(experiment_dir / "raw_risk_grid_stats.csv"),
                 risk_exposure_archive=str(experiment_dir / "raw_risk_exposure.csv"),
+                scripted_actor_telemetry_archive=str(
+                    experiment_dir / "raw_scripted_actor_telemetry.csv"
+                ),
                 risk_grid_present=risk_grid_present,
                 risk_exposure_present=risk_exposure_present,
+                scripted_actor_telemetry_present=scripted_actor_telemetry_present,
                 timed_out=timed_out,
                 scripted_risk_actors_enabled=risk_actor_metadata.enabled,
                 scripted_risk_actor_count=risk_actor_metadata.actor_count,
@@ -581,6 +618,7 @@ def main() -> int:
         "scripted_risk_actors_enabled": risk_actor_metadata.enabled,
         "scripted_risk_actor_count": risk_actor_metadata.actor_count,
         "risk_actor_script_path": str(risk_actor_metadata.script_path),
+        "scripted_actor_telemetry_csv": str(args.scripted_actor_telemetry_csv),
         "output_root": str(output_root),
         "run_plan": str(plan_path),
         "matrix_command": matrix_command,
