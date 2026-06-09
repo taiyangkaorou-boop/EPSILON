@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17/MVP-18 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17/MVP-18/MVP-19/MVP-20 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -312,7 +312,45 @@ matrix.json
 
 `matrix.csv` 每行对应一个实验组，列为常用论文指标，适合直接导入表格或绘图脚本。
 
-## 8. 输出文件
+## 8. 实验输出完整性校验
+
+MVP-20 新增 `risk_experiment_verify_outputs.py`，用于检查 batch 或 scenario suite 输出目录是否完整。
+该脚本只读取离线文件，不启动 ROS，不改变规划行为。
+
+校验单个 batch 输出：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_verify_outputs.py \
+  /tmp/epsilon_batch_highway_v1
+```
+
+校验多场景 suite 输出：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_verify_outputs.py \
+  /tmp/epsilon_scenario_suite
+```
+
+输出：
+
+```text
+verification/verification_report.json
+verification/verification_report.csv
+```
+
+核心规则：
+
+```text
+1. 必须存在 manifest；
+2. status=ok 的实验必须有非空 raw_risk_grid_stats.csv 和 summary.csv；
+3. 若启用脚本 actor，必须有非空 raw_scripted_actor_telemetry.csv；
+4. 若存在成功实验组，必须有 matrix/matrix.csv；
+5. scenario suite 的成功场景必须有场景 matrix 和 matrix_by_scenario 复制件。
+```
+
+校验失败时脚本返回非零值，适合放在论文实验流水线或 CI-like 检查中。
+
+## 9. 输出文件
 
 必定输出：
 
@@ -330,7 +368,7 @@ trajectory_exposure_max.png
 trajectory_risk_score.png
 ```
 
-## 9. 推荐消融实验分组
+## 10. 推荐消融实验分组
 
 ```text
 Baseline SSC
@@ -343,7 +381,7 @@ Adaptive risk weight
 Safety fallback
 ```
 
-## 10. 论文指标对应
+## 11. 论文指标对应
 
 ```text
 risk_grid.sum_risk              -> 风险图总体强度
@@ -371,7 +409,7 @@ safety_fallback_triggered_cycles -> 安全兜底触发的 planning cycle 数
 safety_fallback_switched_cycles -> 安全兜底触发并切换的 planning cycle 数
 ```
 
-## 10. 注意事项
+## 12. 注意事项
 
 脚本不参与 ROS 编译，不改变规划行为。它只读取 CSV 并写入离线报告文件，适合在每次实验运行后单独执行。
 
