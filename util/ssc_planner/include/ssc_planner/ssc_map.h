@@ -130,6 +130,13 @@ class SscMap {
 
     std::array<int, 6> inflate_steps = {{20, 5, 10, 10, 1, 1}};  ///< 六方向膨胀步长 [x+, x-, y+, y-, z+, z-]
 
+    /// @brief 是否启用风险感知 corridor
+    /// @note false 时 risk grid 仍只用于统计/可视化，完全退化为原始 SSC baseline。
+    bool enable_risk_aware_corridor = false;
+    /// @brief 将风险 cell 提升为 hard occupied 的阈值
+    /// @note 使用 risk > threshold 的严格判断；默认 1.0 不会新增占据格。
+    RiskMapDataType risk_occupied_threshold = 1.0f;
+
     /// @brief 打印所有配置参数到控制台
     void Print() {
       printf("\nSscMap Config:\n");
@@ -150,6 +157,10 @@ class SscMap {
       printf(" -- inflate_steps: [%d, %d, %d, %d, %d, %d]\n", inflate_steps[0],
              inflate_steps[1], inflate_steps[2], inflate_steps[3],
              inflate_steps[4], inflate_steps[5]);
+      printf(" -- enable_risk_aware_corridor: %s\n",
+             enable_risk_aware_corridor ? "true" : "false");
+      printf(" -- risk_occupied_threshold: %lf\n",
+             static_cast<double>(risk_occupied_threshold));
     }
   };
 
@@ -165,12 +176,14 @@ class SscMap {
 
   /// @brief 获取风险占据栅格图的只读引用（调试/验证用）
   /// @return 三维风险占据图的 const 引用，值为风险概率 [0.0, 1.0]
-  /// @note MVP-0 中风险图不参与 corridor/QP/行为选择，仅供外部调试读取
+  /// @note 默认仅供外部调试读取；MVP-5 开启 risk-aware corridor 后，
+  ///       高风险 cell 会被阈值化投影到 binary map，间接影响 corridor。
   const RiskGridMap3D& risk_grid() const { return p_3d_risk_grid_; }
 
   /// @brief 计算风险占据栅格的统计信息（只读，不修改任何地图数据）
   /// @return RiskGridStats 结构体，包含 total/ nonzero/ max/ sum/ active_layers/ per_layer
-  /// @note MVP-1A: 用于验证 risk grid 是否被正确 reset 和填充，不参与规划决策
+  /// @note MVP-1A: 用于验证 risk grid 是否被正确 reset 和填充；该函数本身
+  ///       仍然是只读统计，不参与任何规划决策。
   RiskGridStats ComputeRiskGridStats() const;
 
   /// @brief 获取配置
@@ -265,6 +278,13 @@ class SscMap {
   /// @note MVP-1B: 仅用于论文实验数据记录。该函数只读取统计结果并写入
   ///       /tmp/epsilon_risk_grid_stats.csv，不修改地图、不参与 corridor/QP/control。
   void AppendRiskGridStatsToCsv(const RiskGridStats &stats) const;
+
+  /// @brief 将高风险 cell 投影到二值占据图，使 corridor 避开高风险区域
+  /// @return 被提升为 hard occupied 的风险栅格数量
+  /// @note MVP-5: 仅当 enable_risk_aware_corridor 为 true 时由 ConstructSscMap 调用。
+  ///       该函数不修改 p_3d_risk_grid_，只把 risk > threshold 的 cell 写入
+  ///       p_3d_grid_，从而通过 corridor 可行域间接影响 QP。
+  size_t ApplyRiskThresholdToBinaryOccupancy();
 
   /// @brief 检查立方体在 3D 栅格中是否完全无障碍
   /// 遍历立方体内所有栅格单元格，确认均为 0（空闲）
@@ -408,9 +428,9 @@ class SscMap {
   common::GridMapND<SscMapDataType, 3> *p_3d_inflated_grid_;
 
   /// @brief 三维风险占据栅格图 —— 浮点概率值 [0.0, 1.0]
-  /// @note MVP-0 定位: side-channel 调试数据，不参与 corridor 构建和 QP 优化。
-  ///       后续 MVP-1 将接入真实概率预测来源（MOBIL 概率/EUDM 不确定性），
-  ///       MVP-2 将作为 risk cost 或 chance constraint 的输入
+  /// @note 默认是概率风险 side-channel，可用于日志/CSV/RViz；MVP-5 打开
+  ///       enable_risk_aware_corridor 后，高风险 cell 会被提升为 p_3d_grid_
+  ///       中的 hard occupied，从而影响 corridor，但仍不直接进入 QP cost。
   RiskGridMap3D p_3d_risk_grid_;
 
   /// @brief 是否启用 RiskGridStats CSV 导出

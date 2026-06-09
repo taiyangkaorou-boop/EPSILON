@@ -159,6 +159,16 @@ ErrorType SscMap::ConstructSscMap(
     FillDynamicPartProbabilistic(sur_vehicle_trajs_fs, traj_probs);
   }
 
+  /// @brief 第4步（新增 MVP-5）: 按阈值将高风险栅格提升为 hard occupied
+  /// @note 该步骤只在配置开关打开时执行；关闭时完全保持原始 SSC binary map。
+  ///       打开后 risk grid 通过 p_3d_grid_ 间接影响 corridor，不直接修改 QP/control。
+  if (config_.enable_risk_aware_corridor) {
+    const size_t high_risk_cells = ApplyRiskThresholdToBinaryOccupancy();
+    LOG(WARNING) << "[Ssc][RiskAwareCorridor] enabled=true threshold="
+                 << config_.risk_occupied_threshold
+                 << " high_risk_cells=" << high_risk_cells;
+  }
+
   /// @brief 第4步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
   /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
   const auto risk_stats = ComputeRiskGridStats();
@@ -204,6 +214,46 @@ ErrorType SscMap::ClearDrivingCorridor() {
 ErrorType SscMap::ResetRiskMap() {
   std::fill(p_3d_risk_grid_.begin(), p_3d_risk_grid_.end(), 0.0f);
   return kSuccess;
+}
+
+/// @brief 将高风险 cell 投影到原始二值占据图，使 corridor 避开高风险区域
+/// @return 被提升为 hard occupied 的风险栅格数量
+/// @note MVP-5: 这是 risk grid 第一次进入规划链路的位置。实现上不改 corridor
+///       膨胀算法，而是复用现有 p_3d_grid_ 的 occupied/free 语义：0=free，
+///       非0=occupied。由于 risk grid 已在 MVP-4 截断到 [0,1]，默认阈值 1.0
+///       且使用严格大于判断时不会新增占据格，可退化为 baseline。
+size_t SscMap::ApplyRiskThresholdToBinaryOccupancy() {
+  if (!p_3d_grid_) {
+    return 0;
+  }
+
+  const RiskMapDataType threshold =
+      std::max<RiskMapDataType>(
+          0.0f, std::min<RiskMapDataType>(1.0f, config_.risk_occupied_threshold));
+  const int s_dim = p_3d_grid_->dims_size()[0];
+  const int d_dim = p_3d_grid_->dims_size()[1];
+  const int t_dim = p_3d_grid_->dims_size()[2];
+  const int layer_cell_num = s_dim * d_dim;
+  size_t high_risk_cells = 0;
+
+  for (int t_idx = 0; t_idx < t_dim; ++t_idx) {
+    const int layer_offset = t_idx * layer_cell_num;
+    for (int d_idx = 0; d_idx < d_dim; ++d_idx) {
+      const int row_offset = layer_offset + d_idx * s_dim;
+      for (int s_idx = 0; s_idx < s_dim; ++s_idx) {
+        const int risk_idx = row_offset + s_idx;
+        if (risk_idx >= static_cast<int>(p_3d_risk_grid_.size())) {
+          continue;
+        }
+        if (p_3d_risk_grid_[risk_idx] > threshold) {
+          p_3d_grid_->SetValueUsingCoordinate({s_idx, d_idx, t_idx}, 100);
+          ++high_risk_cells;
+        }
+      }
+    }
+  }
+
+  return high_risk_cells;
 }
 
 /// @brief 计算风险占据栅格的统计信息 —— 只读操作，不修改任何地图数据

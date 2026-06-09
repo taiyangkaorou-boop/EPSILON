@@ -156,6 +156,14 @@ ErrorType SscPlanner::Init(const std::string config_path) {
   map_cfg.inflate_steps[3] = cfg_.map_cfg().infl_steps().y_n();
   map_cfg.inflate_steps[4] = cfg_.map_cfg().infl_steps().z_p();
   map_cfg.inflate_steps[5] = cfg_.map_cfg().infl_steps().z_n();
+  // --- MVP-5 风险感知 corridor 参数 ---
+  // 默认配置关闭该功能；打开后只通过 high-risk occupied 收缩 corridor，
+  // 不改 QP 目标函数或 control 输出接口。
+  map_cfg.enable_risk_aware_corridor =
+      cfg_.map_cfg().enable_risk_aware_corridor();
+  map_cfg.risk_occupied_threshold =
+      static_cast<RiskMapDataType>(std::max(
+          0.0, std::min(1.0, cfg_.map_cfg().risk_occupied_threshold())));
 
   // 创建 SSC 地图实例
   p_ssc_map_ = new SscMap(map_cfg);

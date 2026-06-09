@@ -42,6 +42,11 @@ message SscMapCfg {
   required int32 max_grids_along_time = 9;
   required InflateSteps infl_steps = 10;
 
+  // MVP-5: 风险感知 corridor 开关。默认 false 时完全退化为原始 SSC binary map。
+  optional bool enable_risk_aware_corridor = 11 [default = false];
+  // MVP-5: risk grid 转 hard occupied 的阈值。风险值已截断到 [0,1]，
+  // 因此默认 1.0 且使用 ">" 判断时不会新增占据格。
+  optional double risk_occupied_threshold = 12 [default = 1.0];
 }
 
 message Config {
