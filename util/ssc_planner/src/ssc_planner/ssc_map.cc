@@ -52,6 +52,8 @@
 
 #include "ssc_planner/ssc_map.h"
 
+#include <fstream>  // 用于 MVP-1B RiskGridStats CSV 文件追加写入
+
 #include <glog/logging.h>
 
 namespace planning {
@@ -156,6 +158,7 @@ ErrorType SscMap::ConstructSscMap(
   /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
   const auto risk_stats = ComputeRiskGridStats();
   PrintRiskGridStatsIfNeeded(risk_stats);
+  AppendRiskGridStatsToCsv(risk_stats);
 
   return kSuccess;
 }
@@ -284,6 +287,61 @@ void SscMap::PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const {
   for (size_t layer = 0; layer < stats.nonzero_cells_per_layer.size(); ++layer) {
     LOG(WARNING) << "[Ssc][RiskGridStats] layer[" << layer
                  << "] nonzero_cells=" << stats.nonzero_cells_per_layer[layer];
+  }
+}
+
+/// @brief 将风险占据栅格统计结果追加写入 CSV 文件
+/// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
+/// @note MVP-1B: 只做实验数据记录，不修改 risk grid / binary map / corridor。
+///       CSV 字段固定为:
+///       cycle,total_cells,nonzero_cells,max_risk,sum_risk,active_time_layers,total_time_layers
+void SscMap::AppendRiskGridStatsToCsv(const RiskGridStats &stats) const {
+  /// @brief 若 CSV 导出被关闭，立即返回，保持原始规划流程不受影响
+  if (!risk_stats_csv_enabled_) {
+    return;
+  }
+
+  /// @brief 检查目标文件是否为空；空文件需要先写 header，已有数据则直接追加
+  bool csv_file_empty = true;
+  {
+    std::ifstream existing_file(risk_stats_csv_path_);
+    csv_file_empty =
+        !existing_file.good() ||
+        existing_file.peek() == std::ifstream::traits_type::eof();
+  }
+
+  /// @brief 以 append 模式打开 CSV，避免覆盖同一次实验中前面 planning cycle 的数据
+  std::ofstream csv_file(risk_stats_csv_path_, std::ofstream::out | std::ofstream::app);
+  if (!csv_file.is_open()) {
+    LOG(WARNING) << "[Ssc][RiskGridStatsCsv] failed to open "
+                 << risk_stats_csv_path_;
+    return;
+  }
+
+  /// @brief 文件为空时写入一次 header，便于后续 Python/pandas 直接读取
+  if (csv_file_empty) {
+    csv_file << "cycle,total_cells,nonzero_cells,max_risk,sum_risk,"
+             << "active_time_layers,total_time_layers\n";
+    risk_stats_csv_header_written_ = true;
+  } else if (!risk_stats_csv_header_written_) {
+    /// @brief 文件已有 header 或历史数据时，仅同步进程内状态，避免重复写 header
+    risk_stats_csv_header_written_ = true;
+  }
+
+  /// @brief 记录当前 planning cycle 编号；该计数只服务 CSV 实验追踪，不参与规划
+  const size_t current_cycle = risk_stats_cycle_count_;
+  ++risk_stats_cycle_count_;
+
+  /// @brief 追加一行统计数据，total_time_layers 直接来自 per-layer 统计数组长度
+  csv_file << current_cycle << "," << stats.total_cells << ","
+           << stats.nonzero_cells << "," << stats.max_risk << ","
+           << stats.sum_risk << "," << stats.active_time_layers << ","
+           << stats.nonzero_cells_per_layer.size() << "\n";
+
+  /// @brief 写入失败只输出日志，不回滚地图或影响本次规划结果
+  if (!csv_file.good()) {
+    LOG(WARNING) << "[Ssc][RiskGridStatsCsv] failed to write "
+                 << risk_stats_csv_path_;
   }
 }
 

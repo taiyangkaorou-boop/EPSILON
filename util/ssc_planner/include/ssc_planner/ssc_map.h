@@ -243,6 +243,12 @@ class SscMap {
   ///       该函数不触发任何规划逻辑，不影响 corridor/QP/control
   void PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const;
 
+  /// @brief 将风险占据栅格统计结果追加写入 CSV 文件
+  /// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
+  /// @note MVP-1B: 仅用于论文实验数据记录。该函数只读取统计结果并写入
+  ///       /tmp/epsilon_risk_grid_stats.csv，不修改地图、不参与 corridor/QP/control。
+  void AppendRiskGridStatsToCsv(const RiskGridStats &stats) const;
+
   /// @brief 检查立方体在 3D 栅格中是否完全无障碍
   /// 遍历立方体内所有栅格单元格，确认均为 0（空闲）
   bool CheckIfCubeIsFree(GridMap3D *p_grid,
@@ -380,6 +386,23 @@ class SscMap {
   ///       后续 MVP-1 将接入真实概率预测来源（MOBIL 概率/EUDM 不确定性），
   ///       MVP-2 将作为 risk cost 或 chance constraint 的输入
   RiskGridMap3D p_3d_risk_grid_;
+
+  /// @brief 是否启用 RiskGridStats CSV 导出
+  /// @note MVP-1B 默认启用，便于直接获得论文实验统计数据；关闭该开关时
+  ///       AppendRiskGridStatsToCsv() 会立即返回，不影响规划流程。
+  bool risk_stats_csv_enabled_ = true;
+
+  /// @brief RiskGridStats CSV 默认输出路径
+  /// @note 使用 /tmp 目录避免要求用户提前配置输出目录；后续 MVP 可再接入配置文件。
+  std::string risk_stats_csv_path_ = "/tmp/epsilon_risk_grid_stats.csv";
+
+  /// @brief CSV 表头是否已经在本进程中处理过
+  /// @note mutable 允许 const 统计输出函数记录 IO 状态，不改变地图或规划语义。
+  mutable bool risk_stats_csv_header_written_ = false;
+
+  /// @brief CSV 导出的规划周期计数器
+  /// @note 每次 ConstructSscMap() 完成风险统计后递增，用于关联日志和 CSV 行。
+  mutable size_t risk_stats_cycle_count_ = 0;
 
   /// 立方体膨胀方向的禁用记录（暂未激活使用）
   std::unordered_map<int, std::array<bool, 6>> inters_for_cube_;
