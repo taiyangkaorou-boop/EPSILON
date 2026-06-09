@@ -23,6 +23,9 @@ from typing import Dict, Iterable, List, Optional
 DEFAULT_SCENARIOS = [
     "highway_v1.0",
     "highway_lite",
+    "risk_dense_following_v1.0",
+    "risk_merge_pressure_v1.0",
+    "risk_lane_change_conflict_v1.0",
     "ring_small_v1.0",
     "ring_tiny_v1.0",
 ]
