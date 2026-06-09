@@ -36,6 +36,7 @@ install(PROGRAMS
     scripts/risk_experiment_report.py
     scripts/risk_experiment_matrix.py
     scripts/risk_experiment_verify_outputs.py
+    scripts/risk_experiment_figure_pack.py
     DESTINATION share/${PROJECT_NAME}/scripts
 )
 install(FILES
