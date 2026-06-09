@@ -143,6 +143,7 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
 {enable_scripted_risk_actors}
 {risk_actor_script_path}
 {risk_actor_publish_rate_hz}
+{scripted_actor_telemetry_csv}
 ```
 
 `manifest.json` 会记录每组实验命令、配置路径、返回码、CSV 是否存在、summary 路径和 matrix 命令。
@@ -181,6 +182,23 @@ risk_actor_script_path
 MVP-18 在脚本 actor 中新增 `idm_follow` 模式：actor 会订阅 `/arena_info_dynamic`，
 根据目标前车距离和相对速度计算 IDM 纵向加速度，再叠加脚本横向偏移。
 该能力只用于实验场景控制，不改变规划器预测、risk grid、corridor 或 QP。
+
+MVP-19 新增脚本 actor telemetry CSV，默认路径为：
+
+```text
+/tmp/epsilon_scripted_risk_actor_telemetry.csv
+```
+
+闭环 launch 会把 actor 每个发布周期的模式、目标车、当前位置、脚本横向偏移、
+gap、相对速度、IDM 加速度和最终 `ControlSignal` 写入 CSV。batch 执行每组实验前
+会清理旧 telemetry，并在实验目录归档为：
+
+```text
+raw_scripted_actor_telemetry.csv
+```
+
+若当前场景启用了脚本 actor 但没有生成 telemetry，batch 会把该组标记为
+`data_missing`，避免缺少交互证据的实验静默进入最终 matrix。
 
 ## 5. 多场景实验套件
 

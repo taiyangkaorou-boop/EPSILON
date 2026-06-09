@@ -79,6 +79,14 @@ def generate_launch_description():
     risk_actor_publish_rate_hz = DeclareLaunchArgument(
         "risk_actor_publish_rate_hz", default_value="50.0"
     )
+    # MVP-19: 脚本化周车运行 telemetry 默认落到 /tmp，便于 batch 在每组实验后归档。
+    scripted_actor_telemetry_enabled = DeclareLaunchArgument(
+        "scripted_actor_telemetry_enabled", default_value="true"
+    )
+    scripted_actor_telemetry_csv = DeclareLaunchArgument(
+        "scripted_actor_telemetry_csv",
+        default_value="/tmp/epsilon_scripted_risk_actor_telemetry.csv",
+    )
 
     # 批量实验不依赖物理手柄，直接启动仿真节点，避免 joy_node 在无手柄机器上失败。
     vehicle_info_path = PathJoinSubstitution([
@@ -121,6 +129,8 @@ def generate_launch_description():
             "script_path": LaunchConfiguration("risk_actor_script_path"),
             "vehicle_info_path": vehicle_info_path,
             "publish_rate_hz": LaunchConfiguration("risk_actor_publish_rate_hz"),
+            "telemetry_csv_enabled": LaunchConfiguration("scripted_actor_telemetry_enabled"),
+            "telemetry_csv_path": LaunchConfiguration("scripted_actor_telemetry_csv"),
         }],
     )
 
@@ -152,11 +162,14 @@ def generate_launch_description():
         enable_scripted_risk_actors,
         risk_actor_script_path,
         risk_actor_publish_rate_hz,
+        scripted_actor_telemetry_enabled,
+        scripted_actor_telemetry_csv,
         LogInfo(msg=["planner_backend: ", LaunchConfiguration("planner_backend")]),
         LogInfo(msg=["playground: ", LaunchConfiguration("playground")]),
         LogInfo(msg=["ssc_config_path: ", LaunchConfiguration("ssc_config_path")]),
         LogInfo(msg=["enable_scripted_risk_actors: ", LaunchConfiguration("enable_scripted_risk_actors")]),
         LogInfo(msg=["risk_actor_script_path: ", LaunchConfiguration("risk_actor_script_path")]),
+        LogInfo(msg=["scripted_actor_telemetry_csv: ", LaunchConfiguration("scripted_actor_telemetry_csv")]),
         LogInfo(msg=["vehicle_info_path: ", vehicle_info_path]),
         LogInfo(msg=["map_path: ", map_path]),
         LogInfo(msg=["lane_net_path: ", lane_net_path]),
