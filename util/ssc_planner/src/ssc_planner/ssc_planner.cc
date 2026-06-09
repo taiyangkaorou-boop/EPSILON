@@ -128,6 +128,8 @@ ErrorType SscPlanner::Init(const std::string config_path) {
          cfg_.planner_cfg().enable_risk_exposure_reselect() ? "true" : "false");
   printf(" -- risk_exposure_weight: %lf\n",
          cfg_.planner_cfg().risk_exposure_weight());
+  printf(" -- enable_adaptive_risk_weight: %s\n",
+         cfg_.planner_cfg().enable_adaptive_risk_weight() ? "true" : "false");
 
   LOG(INFO) << "[Ssc]SscPlanner Config:";
   LOG(INFO) << "[Ssc] -- low spd threshold: "
@@ -140,6 +142,8 @@ ErrorType SscPlanner::Init(const std::string config_path) {
             << cfg_.planner_cfg().enable_risk_exposure_reselect();
   LOG(INFO) << "[Ssc] -- risk_exposure_weight: "
             << cfg_.planner_cfg().risk_exposure_weight();
+  LOG(INFO) << "[Ssc] -- enable_adaptive_risk_weight: "
+            << cfg_.planner_cfg().enable_adaptive_risk_weight();
 
   // 第二步：构建 SscMap 配置并从 protobuf 映射参数
   SscMap::Config map_cfg;
@@ -690,12 +694,20 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
   int index = baseline_index;
   std::vector<RiskExposureMetrics> risk_metrics;
   if (IsRiskExposureEvaluationEnabled()) {
+    AdaptiveRiskWeightContext risk_context = BuildBaseAdaptiveRiskWeightContext();
     risk_metrics.reserve(static_cast<size_t>(num_valid_behaviors));
     for (int i = 0; i < num_valid_behaviors; ++i) {
-      risk_metrics.push_back(ComputeRiskExposureForCandidate(i));
+      risk_metrics.push_back(
+          ComputeRiskExposureForCandidate(i, risk_context.high_risk_threshold));
     }
-    index = SelectRiskAwareTrajectoryIndex(baseline_index, risk_metrics);
-    AppendRiskExposureMetricsToCsv(risk_metrics, baseline_index, index);
+    UpdateAdaptiveRiskWeightContextByMetrics(risk_metrics, &risk_context);
+    for (auto& metric : risk_metrics) {
+      metric.risk_score = risk_context.risk_weight * metric.exposure_sum;
+    }
+    index = SelectRiskAwareTrajectoryIndex(
+        baseline_index, risk_metrics, risk_context);
+    AppendRiskExposureMetricsToCsv(
+        risk_metrics, baseline_index, index, risk_context);
   }
 
   // 封装最终轨迹: 高速用 Bezier, 低速用 primitive
@@ -742,7 +754,7 @@ int SscPlanner::FindBaselineTrajectoryIndex() const {
 /// @note MVP-6: 沿已求解成功的 Bezier 轨迹采样 (s,d,t)，从 risk grid 查询风险。
 ///       这里不改变 Bezier 控制点，也不把风险写回 QP 目标或 corridor 约束。
 SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
-    const int candidate_index) const {
+    const int candidate_index, const decimal_t high_risk_threshold) const {
   RiskExposureMetrics metrics;
   metrics.candidate_index = candidate_index;
   if (candidate_index < 0 || candidate_index >= static_cast<int>(qp_trajs_.size()) ||
@@ -758,8 +770,7 @@ SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
   // 采样步长做下限保护，避免配置为 0 或负数时进入死循环。
   const decimal_t sample_dt =
       std::max<decimal_t>(cfg_.planner_cfg().risk_exposure_sample_dt(), 1.0e-3);
-  const decimal_t high_threshold =
-      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_high_threshold());
+  const decimal_t high_threshold = std::max<decimal_t>(0.0, high_risk_threshold);
 
   for (decimal_t t = begin_t; t <= end_t + kEPS; t += sample_dt) {
     const decimal_t query_t = std::min(t, end_t);
@@ -804,9 +815,10 @@ SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
 /// @note 重选是 soft ranking：只在 QP 已成功的候选集合中比较，不制造新轨迹。
 int SscPlanner::SelectRiskAwareTrajectoryIndex(
     const int baseline_index,
-    const std::vector<RiskExposureMetrics>& metrics) const {
+    const std::vector<RiskExposureMetrics>& metrics,
+    const AdaptiveRiskWeightContext& risk_context) const {
   if (!cfg_.planner_cfg().enable_risk_exposure_reselect() ||
-      cfg_.planner_cfg().risk_exposure_weight() <= 0.0 || baseline_index < 0 ||
+      risk_context.risk_weight <= 0.0 || baseline_index < 0 ||
       baseline_index >= static_cast<int>(metrics.size())) {
     return baseline_index;
   }
@@ -824,8 +836,7 @@ int SscPlanner::SelectRiskAwareTrajectoryIndex(
   }
 
   const decimal_t baseline_score = metrics[baseline_index].risk_score;
-  const decimal_t switch_margin =
-      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_switch_margin());
+  const decimal_t switch_margin = std::max<decimal_t>(0.0, risk_context.switch_margin);
   if (risk_selected_index != baseline_index &&
       baseline_score - best_score > switch_margin) {
     LOG(WARNING) << "[Ssc][MVP6RiskReselect] baseline_behavior="
@@ -856,7 +867,8 @@ int SscPlanner::SelectRiskAwareTrajectoryIndex(
 /// @note CSV 用于论文实验复现；写入失败只记录 warning，不中断规划。
 void SscPlanner::AppendRiskExposureMetricsToCsv(
     const std::vector<RiskExposureMetrics>& metrics,
-    const int baseline_index, const int selected_index) const {
+    const int baseline_index, const int selected_index,
+    const AdaptiveRiskWeightContext& risk_context) const {
   const std::string csv_path = cfg_.planner_cfg().risk_exposure_csv_path();
   if (csv_path.empty()) {
     return;
@@ -878,7 +890,10 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
   if (csv_file_empty) {
     csv_file << "cycle,stamp,candidate_index,behavior,is_baseline,is_selected,"
                 "sample_count,exposure_sum,exposure_mean,exposure_max,"
-                "high_risk_hits,risk_score\n";
+                "high_risk_hits,risk_score,adaptive_enabled,high_speed,"
+                "lane_change,high_interaction_risk,adaptive_risk_weight,"
+                "adaptive_switch_margin,adaptive_high_risk_threshold,"
+                "adaptive_max_candidate_risk,adaptive_applied_scale\n";
     risk_exposure_csv_header_written_ = true;
   } else if (!risk_exposure_csv_header_written_) {
     // 文件已有内容时认为 header 已存在，避免重复写入表头。
@@ -899,6 +914,13 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
                  << " exposure_max=" << metric.exposure_max
                  << " high_risk_hits=" << metric.high_risk_hits
                  << " risk_score=" << metric.risk_score
+                 << " adaptive_enabled=" << risk_context.enabled
+                 << " high_speed=" << risk_context.high_speed
+                 << " lane_change=" << risk_context.lane_change
+                 << " high_interaction_risk="
+                 << risk_context.high_interaction_risk
+                 << " adaptive_risk_weight=" << risk_context.risk_weight
+                 << " adaptive_scale=" << risk_context.applied_scale
                  << " is_baseline=" << is_baseline
                  << " is_selected=" << is_selected;
 
@@ -908,7 +930,16 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
              << (is_baseline ? 1 : 0) << "," << (is_selected ? 1 : 0) << ","
              << metric.sample_count << "," << metric.exposure_sum << ","
              << metric.exposure_mean << "," << metric.exposure_max << ","
-             << metric.high_risk_hits << "," << metric.risk_score << "\n";
+             << metric.high_risk_hits << "," << metric.risk_score << ","
+             << (risk_context.enabled ? 1 : 0) << ","
+             << (risk_context.high_speed ? 1 : 0) << ","
+             << (risk_context.lane_change ? 1 : 0) << ","
+             << (risk_context.high_interaction_risk ? 1 : 0) << ","
+             << risk_context.risk_weight << ","
+             << risk_context.switch_margin << ","
+             << risk_context.high_risk_threshold << ","
+             << risk_context.max_candidate_risk << ","
+             << risk_context.applied_scale << "\n";
   }
 
   if (!csv_file.good()) {
@@ -919,10 +950,117 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
 /// @brief 判断是否启用 MVP-6 候选轨迹风险暴露评价
 /// @return true 表示需要保存 risk grid 快照并计算 exposure
 /// @note 默认配置下 eval/reselect 都为 false，因此不保存快照、不采样、不写 CSV，
-///       轨迹选择直接退回原始 SSC baseline。
+///       轨迹选择直接退回原始 SSC baseline。MVP-7 自适应权重只在该评价链路中生效。
 bool SscPlanner::IsRiskExposureEvaluationEnabled() const {
   return cfg_.planner_cfg().enable_risk_exposure_eval() ||
          cfg_.planner_cfg().enable_risk_exposure_reselect();
+}
+
+/// @brief 根据当前自车状态和行为构建基础自适应风险上下文
+/// @return 当前周期生效的风险参数
+/// @note 默认关闭时仅返回 MVP-6 静态参数；开启后按高速/变道场景放大风险权重。
+SscPlanner::AdaptiveRiskWeightContext
+SscPlanner::BuildBaseAdaptiveRiskWeightContext() const {
+  AdaptiveRiskWeightContext context;
+  context.enabled = cfg_.planner_cfg().enable_adaptive_risk_weight();
+  context.risk_weight =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_weight());
+  context.switch_margin =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_switch_margin());
+  context.high_risk_threshold =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_high_threshold());
+
+  if (!context.enabled) {
+    return context;
+  }
+
+  const decimal_t high_speed_threshold =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().adaptive_high_speed_threshold());
+  context.high_speed = initial_state_.velocity > high_speed_threshold;
+  context.lane_change =
+      ego_behavior_ == common::LateralBehavior::kLaneChangeLeft ||
+      ego_behavior_ == common::LateralBehavior::kLaneChangeRight;
+
+  decimal_t weight_scale = 1.0;
+  if (context.high_speed) {
+    weight_scale *= std::max<decimal_t>(
+        1.0, cfg_.planner_cfg().adaptive_high_speed_weight_scale());
+  }
+  if (context.lane_change) {
+    weight_scale *= std::max<decimal_t>(
+        1.0, cfg_.planner_cfg().adaptive_lane_change_weight_scale());
+  }
+
+  const decimal_t max_weight =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().adaptive_max_risk_weight());
+  context.risk_weight = std::min(context.risk_weight * weight_scale, max_weight);
+  context.applied_scale = weight_scale;
+
+  LOG(WARNING) << "[Ssc][MVP7AdaptiveRiskWeight] base_context"
+               << " high_speed=" << context.high_speed
+               << " lane_change=" << context.lane_change
+               << " ego_speed=" << initial_state_.velocity
+               << " risk_weight=" << context.risk_weight
+               << " switch_margin=" << context.switch_margin
+               << " high_risk_threshold=" << context.high_risk_threshold
+               << " applied_scale=" << context.applied_scale;
+
+  return context;
+}
+
+/// @brief 根据候选轨迹风险统计更新自适应风险上下文
+/// @param metrics 当前周期所有 QP 成功候选的风险暴露统计
+/// @param risk_context 输入/输出风险上下文
+/// @note 高交互风险由候选最大单点风险触发；触发后进一步提高权重并降低切换裕度。
+void SscPlanner::UpdateAdaptiveRiskWeightContextByMetrics(
+    const std::vector<RiskExposureMetrics>& metrics,
+    AdaptiveRiskWeightContext* risk_context) const {
+  if (!risk_context) {
+    return;
+  }
+
+  risk_context->max_candidate_risk = 0.0;
+  for (const auto& metric : metrics) {
+    risk_context->max_candidate_risk =
+        std::max(risk_context->max_candidate_risk, metric.exposure_max);
+  }
+
+  if (!risk_context->enabled) {
+    return;
+  }
+
+  const decimal_t high_interaction_threshold =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().adaptive_high_risk_threshold());
+  risk_context->high_interaction_risk =
+      risk_context->max_candidate_risk > high_interaction_threshold;
+  if (!risk_context->high_interaction_risk) {
+    return;
+  }
+
+  const decimal_t risk_scale = std::max<decimal_t>(
+      1.0, cfg_.planner_cfg().adaptive_high_risk_weight_scale());
+  const decimal_t max_weight =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().adaptive_max_risk_weight());
+  risk_context->risk_weight =
+      std::min(risk_context->risk_weight * risk_scale, max_weight);
+  risk_context->applied_scale *= risk_scale;
+
+  const decimal_t switch_margin_scale = std::max<decimal_t>(
+      0.0, cfg_.planner_cfg().adaptive_switch_margin_scale());
+  risk_context->switch_margin *= switch_margin_scale;
+
+  LOG(WARNING) << "[Ssc][MVP7AdaptiveRiskWeight] enabled=true"
+               << " high_speed=" << risk_context->high_speed
+               << " lane_change=" << risk_context->lane_change
+               << " high_interaction_risk="
+               << risk_context->high_interaction_risk
+               << " max_candidate_risk="
+               << risk_context->max_candidate_risk
+               << " risk_weight=" << risk_context->risk_weight
+               << " switch_margin=" << risk_context->switch_margin
+               << " high_risk_threshold="
+               << risk_context->high_risk_threshold
+               << " applied_scale=" << risk_context->applied_scale;
 }
 
 /// @brief 时空走廊可行性检查

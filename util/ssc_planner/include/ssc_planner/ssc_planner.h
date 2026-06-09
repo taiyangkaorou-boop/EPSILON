@@ -217,6 +217,20 @@ class SscPlanner : public Planner {
     decimal_t risk_score = 0.0;                ///< 加权风险软代价 λ_risk * exposure_sum
   };
 
+  /// @brief MVP-7 场景自适应风险参数
+  /// @note 该结构保存当前 planning cycle 的有效风险参数；默认等于 MVP-6 静态配置。
+  struct AdaptiveRiskWeightContext {
+    bool enabled = false;                       ///< 本周期是否启用自适应调参
+    bool high_speed = false;                    ///< 是否处于高速场景
+    bool lane_change = false;                   ///< 当前 ego_behavior_ 是否为变道
+    bool high_interaction_risk = false;         ///< 候选风险峰值是否超过高交互阈值
+    decimal_t risk_weight = 0.0;                ///< 当前生效的风险暴露权重
+    decimal_t switch_margin = 0.0;              ///< 当前生效的候选切换裕度
+    decimal_t high_risk_threshold = 0.0;        ///< high_risk_hits 统计阈值，保持测量语义稳定
+    decimal_t max_candidate_risk = 0.0;         ///< 本轮候选轨迹观察到的最大风险
+    decimal_t applied_scale = 1.0;              ///< 权重总倍率，便于日志/CSV 追溯
+  };
+
   /// @brief 从 protobuf 文本文件读取配置
   ErrorType ReadConfig(const std::string config_path);
 
@@ -281,10 +295,11 @@ class SscPlanner : public Planner {
 
   /// @brief 计算单条 QP 候选 Bezier 轨迹的风险暴露
   /// @param candidate_index qp_trajs_ / valid_behaviors_ 中的候选索引
+  /// @param high_risk_threshold 单点风险统计阈值
   /// @return 风险暴露统计；若采样失败则 sample_count 为 0，风险默认为 0
   /// @note MVP-6: 只读 p_ssc_map_ 的 risk grid，不修改 QP 轨迹、走廊或地图。
   RiskExposureMetrics ComputeRiskExposureForCandidate(
-      const int candidate_index) const;
+      const int candidate_index, const decimal_t high_risk_threshold) const;
 
   /// @brief 选择风险软代价最低的候选轨迹
   /// @param baseline_index 原始 SSC 行为选择得到的候选索引
@@ -293,7 +308,8 @@ class SscPlanner : public Planner {
   /// @note 只有 enable_risk_exposure_reselect=true 且风险优势超过切换裕度时才会改变选择。
   int SelectRiskAwareTrajectoryIndex(
       const int baseline_index,
-      const std::vector<RiskExposureMetrics>& metrics) const;
+      const std::vector<RiskExposureMetrics>& metrics,
+      const AdaptiveRiskWeightContext& risk_context) const;
 
   /// @brief 将 MVP-6 候选轨迹风险暴露结果追加写入 CSV
   /// @param metrics 所有候选轨迹风险暴露统计
@@ -302,12 +318,26 @@ class SscPlanner : public Planner {
   /// @note CSV 仅用于论文实验分析；写入失败只打日志，不中断规划。
   void AppendRiskExposureMetricsToCsv(
       const std::vector<RiskExposureMetrics>& metrics,
-      const int baseline_index, const int selected_index) const;
+      const int baseline_index, const int selected_index,
+      const AdaptiveRiskWeightContext& risk_context) const;
 
   /// @brief 判断 MVP-6 风险暴露评价是否需要启用
   /// @return true 表示需要保存 risk grid 快照并计算候选轨迹 exposure
   /// @note 评价开关或重选开关任一打开时都需要计算；默认二者关闭，不增加 baseline 开销。
   bool IsRiskExposureEvaluationEnabled() const;
+
+  /// @brief 根据当前场景构建基础自适应风险参数
+  /// @return 当前周期的风险参数上下文，默认等于 MVP-6 静态配置
+  /// @note 该函数只使用 SSC 已有输入（自车速度、ego_behavior_ 和配置），不访问 EUDM/MPDM。
+  AdaptiveRiskWeightContext BuildBaseAdaptiveRiskWeightContext() const;
+
+  /// @brief 根据候选轨迹风险统计更新自适应风险参数
+  /// @param metrics 当前 QP 成功候选的风险暴露统计
+  /// @param risk_context 输入/输出：更新 high_interaction_risk、权重、裕度和阈值
+  /// @note MVP-7 将“高交互风险”定义为候选轨迹中 exposure_max 超过配置阈值。
+  void UpdateAdaptiveRiskWeightContextByMetrics(
+      const std::vector<RiskExposureMetrics>& metrics,
+      AdaptiveRiskWeightContext* risk_context) const;
 
   // =========================================================================
   // 成员变量
