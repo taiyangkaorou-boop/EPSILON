@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17/MVP-18 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -178,6 +178,9 @@ risk_actor_script_path
 ```
 
 这样论文实验表格可以直接区分“普通初始态风险场景”和“主动脚本交互场景”。
+MVP-18 在脚本 actor 中新增 `idm_follow` 模式：actor 会订阅 `/arena_info_dynamic`，
+根据目标前车距离和相对速度计算 IDM 纵向加速度，再叠加脚本横向偏移。
+该能力只用于实验场景控制，不改变规划器预测、risk grid、corridor 或 QP。
 
 ## 5. 多场景实验套件
 
@@ -199,6 +202,7 @@ risk_dense_following_v1.0
 risk_merge_pressure_v1.0
 risk_lane_change_conflict_v1.0
 risk_scripted_cut_in_v1.0
+risk_idm_cut_in_v1.0
 ring_small_v1.0
 ring_tiny_v1.0
 ```
@@ -214,6 +218,7 @@ risk_dense_following_v1.0/
 risk_merge_pressure_v1.0/
 risk_lane_change_conflict_v1.0/
 risk_scripted_cut_in_v1.0/
+risk_idm_cut_in_v1.0/
 ring_small_v1.0/
 ring_tiny_v1.0/
 ```
@@ -224,6 +229,8 @@ ring_tiny_v1.0/
 这些场景不包含主动 cut-in 控制器，论文中应表述为“高密度/相对速度风险场景”。
 `risk_scripted_cut_in_v1.0` 来自 MVP-16，额外包含 `risk_actor_script.json`，
 会启动脚本化周车控制器制造可复现的主动切入/制动压力场景。
+`risk_idm_cut_in_v1.0` 来自 MVP-18，在主动切入基础上让切入车使用 IDM 纵向跟车，
+更接近“周车对前车制动做闭环反应”的交互压力场景。
 
 显式执行：
 

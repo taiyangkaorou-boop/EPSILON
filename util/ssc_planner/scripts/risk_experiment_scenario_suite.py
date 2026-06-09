@@ -27,6 +27,7 @@ DEFAULT_SCENARIOS = [
     "risk_merge_pressure_v1.0",
     "risk_lane_change_conflict_v1.0",
     "risk_scripted_cut_in_v1.0",
+    "risk_idm_cut_in_v1.0",
     "ring_small_v1.0",
     "ring_tiny_v1.0",
 ]
