@@ -35,6 +35,19 @@
 
 namespace planning {
 
+/// @brief 周围车辆某一种横向行为模态下的预测轨迹
+/// @note 这是 SSC risk grid 专用旁路结构，暂不写入 core/common 全局语义契约。
+struct SurroundingVehicleTrajectoryMode {
+  int vehicle_id = kInvalidAgentId;  ///< 周围车辆 ID
+  common::LateralBehavior lat_behavior{common::LateralBehavior::kUndefined};  ///< 该模态对应的横向行为
+  decimal_t probability{0.0};  ///< 该模态概率，来自 SemanticVehicle.probs_lat_behaviors
+  vec_E<common::Vehicle> traj;  ///< 全局坐标系下的预测轨迹
+};
+
+/// @brief 周围车辆多模态预测轨迹集合，key=车辆ID
+using MultiModalSurroundingTrajectories =
+    std::unordered_map<int, vec_E<SurroundingVehicleTrajectoryMode>>;
+
 /// @class SscPlannerMapItf
 /// @brief SSC 规划器地图接口 —— 所有环境数据提供者的抽象基类
 ///
@@ -133,6 +146,12 @@ class SscPlannerMapItf {
   /// @note MVP-2 只把已有单条确定性周车轨迹按概率加权，不生成多模态轨迹。
   virtual ErrorType GetSurroundingTrajectoryExistenceProbabilities(
       std::unordered_map<int, decimal_t>* traj_probs) = 0;
+
+  /// @brief 获取周围车辆多模态预测轨迹，供 risk grid 使用
+  /// @param multimodal_trajs 输出: key=车辆ID, value=该车多个横向行为模态
+  /// @note MVP-3 只让 risk grid 消费该旁路，不改变 binary map/corridor/QP。
+  virtual ErrorType GetMultiModalSurroundingTrajectories(
+      MultiModalSurroundingTrajectories* multimodal_trajs) = 0;
 };
 
 }  // namespace planning

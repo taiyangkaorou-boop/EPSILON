@@ -138,7 +138,8 @@ ErrorType SscMap::ConstructSscMap(
     const std::unordered_map<int, vec_E<common::FsVehicle>>
         &sur_vehicle_trajs_fs,
     const vec_E<Vec2f> &obstacle_grids,
-    const std::unordered_map<int, decimal_t> &traj_probs) {
+    const std::unordered_map<int, decimal_t> &traj_probs,
+    const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs) {
   // 清空两张栅格地图
   p_3d_grid_->clear_data();
   p_3d_inflated_grid_->clear_data();
@@ -151,8 +152,12 @@ ErrorType SscMap::ConstructSscMap(
 
   /// @brief 第3步（新增）: 概率化填充动态障碍物到风险占据图
   /// @note 此步骤在原始 binary 填充之后执行，不影响二进制占据图。
-  ///       MVP-2 中 existence_prob 来自周车 argmax 横向行为概率。
-  FillDynamicPartProbabilistic(sur_vehicle_trajs_fs, traj_probs);
+  ///       MVP-3 优先使用周车多模态轨迹；若没有多模态数据，则回退 MVP-2。
+  if (!multimodal_trajs_fs.empty()) {
+    FillDynamicPartProbabilistic(multimodal_trajs_fs);
+  } else {
+    FillDynamicPartProbabilistic(sur_vehicle_trajs_fs, traj_probs);
+  }
 
   /// @brief 第4步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
   /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
@@ -1245,6 +1250,24 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
               0.0, std::min<decimal_t>(1.0, prob_it->second)));
     }
     FillMapWithFsVehicleTrajProbabilistic(it->second, existence_prob);
+  }
+  return kSuccess;
+}
+
+/// @brief 概率化填充多模态动态障碍物 —— 每个 vehicle_id 可对应多个行为模态
+/// @param multimodal_trajs_fs 周围车辆多模态 Frenet 轨迹集合
+/// @return kSuccess
+/// @note MVP-3 仅写入 risk grid；binary map 仍由 FillDynamicPart() 使用确定性轨迹构建。
+ErrorType SscMap::FillDynamicPartProbabilistic(
+    const MultiModalSurroundingFsTrajectories& multimodal_trajs_fs) {
+  for (const auto& vehicle_modes : multimodal_trajs_fs) {
+    for (const auto& mode : vehicle_modes.second) {
+      const float existence_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0, mode.probability)));
+      if (existence_prob <= 0.0f) continue;
+      FillMapWithFsVehicleTrajProbabilistic(mode.traj, existence_prob);
+    }
   }
   return kSuccess;
 }

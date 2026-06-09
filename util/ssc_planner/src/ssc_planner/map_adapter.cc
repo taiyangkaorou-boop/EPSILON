@@ -133,6 +133,82 @@ ErrorType SscPlannerAdapter::GetSurroundingTrajectoryExistenceProbabilities(
   return kSuccess;
 }
 
+/// @brief 获取周围车辆多模态预测轨迹，供 SSC risk grid 使用
+///
+/// MVP-3 仅生成 risk grid 旁路输入：对每辆语义周车，读取 LK/LCL/LCR
+/// 的行为概率；概率大于阈值且参考车道可构建时，调用语义地图已有开环
+/// 预测器生成一条 Vehicle 轨迹。原始 deterministic surround_trajs 不变。
+ErrorType SscPlannerAdapter::GetMultiModalSurroundingTrajectories(
+    MultiModalSurroundingTrajectories* multimodal_trajs) {
+  if (!is_valid_ || multimodal_trajs == nullptr) return kWrongStatus;
+
+  multimodal_trajs->clear();
+  const auto semantic_vehicle_set = map_->semantic_surrounding_vehicles();
+  const std::vector<common::LateralBehavior> candidate_behaviors = {
+      common::LateralBehavior::kLaneKeeping,
+      common::LateralBehavior::kLaneChangeLeft,
+      common::LateralBehavior::kLaneChangeRight};
+
+  constexpr decimal_t kMinModeProbability = 1.0e-6;
+  constexpr decimal_t kPredictionTime = 5.0;
+  constexpr decimal_t kPredictionStep = 0.2;
+  constexpr decimal_t kBackwardLaneLength = 10.0;
+
+  for (const auto& entry : semantic_vehicle_set.semantic_vehicles) {
+    const int vehicle_id = entry.first;
+    const auto& semantic_vehicle = entry.second;
+    const auto& probs = semantic_vehicle.probs_lat_behaviors;
+
+    if (!probs.is_valid) continue;
+
+    vec_E<SurroundingVehicleTrajectoryMode> modes;
+    for (const auto& behavior : candidate_behaviors) {
+      const auto prob_it = probs.probs.find(behavior);
+      if (prob_it == probs.probs.end()) continue;
+
+      const decimal_t probability = std::max<decimal_t>(
+          0.0, std::min<decimal_t>(1.0, prob_it->second));
+      if (probability <= kMinModeProbability) continue;
+
+      common::Lane ref_lane;
+      const decimal_t forward_lane_len =
+          std::max(semantic_vehicle.vehicle.state().velocity * kPredictionTime,
+                   50.0);
+      if (map_->GetRefLaneForStateByBehavior(
+              semantic_vehicle.vehicle.state(), std::vector<int>(), behavior,
+              forward_lane_len, kBackwardLaneLength, false, &ref_lane) !=
+          kSuccess) {
+        continue;
+      }
+
+      vec_E<common::State> pred_states;
+      if (map_->TrajectoryPredictionForVehicle(semantic_vehicle.vehicle,
+                                               ref_lane, kPredictionTime,
+                                               kPredictionStep,
+                                               &pred_states) != kSuccess) {
+        continue;
+      }
+      if (pred_states.empty()) continue;
+
+      SurroundingVehicleTrajectoryMode mode;
+      mode.vehicle_id = vehicle_id;
+      mode.lat_behavior = behavior;
+      mode.probability = probability;
+      for (const auto& state : pred_states) {
+        common::Vehicle vehicle = semantic_vehicle.vehicle;
+        vehicle.set_state(state);
+        mode.traj.emplace_back(vehicle);
+      }
+      modes.emplace_back(mode);
+    }
+
+    if (!modes.empty()) {
+      multimodal_trajs->insert({vehicle_id, modes});
+    }
+  }
+  return kSuccess;
+}
+
 /// @brief 获取自车当前离散横向行为
 ///
 /// 行为来源于 EUDM (紧急-效用决策模型) 或其他行为规划器的输出,
