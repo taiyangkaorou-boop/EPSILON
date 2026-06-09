@@ -2,7 +2,8 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11 离线实验工具，用于把规划运行时导出的 CSV 转换为论文实验表格、趋势图和多实验消融矩阵。
+该目录提供 MVP-9/MVP-11/MVP-12 实验工具，用于把规划运行时导出的 CSV
+转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
 
@@ -59,7 +60,78 @@ rm -f /tmp/epsilon_risk_grid_stats.csv /tmp/epsilon_mvp6_risk_exposure.csv
 
 这样可以避免 observe / corridor / full 等不同实验组写入同一个 `/tmp` CSV 后互相污染。
 
-## 4. 单组实验汇总
+## 4. 批量实验编排
+
+MVP-12 新增 `risk_experiment_batch.py`，用于固化如下流程：
+
+```text
+清理 /tmp CSV
+-> 运行一组实验命令
+-> 归档 raw_risk_grid_stats.csv / raw_risk_exposure.csv
+-> 调用 risk_experiment_report.py 生成 summary
+-> 所有成功组调用 risk_experiment_matrix.py 生成 matrix
+```
+
+默认只生成 dry-run 计划，不启动 ROS：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_batch.py \
+  --output-root /tmp/epsilon_batch_highway_v1 \
+  --scenario-name highway_v1.0 \
+  --duration-sec 60
+```
+
+输出：
+
+```text
+manifest.json
+run_plan.sh
+baseline/
+observe/
+corridor/
+full/
+```
+
+确认 `run_plan.sh` 无误后，可以显式执行：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_batch.py \
+  --execute \
+  --output-root /tmp/epsilon_batch_highway_v1 \
+  --scenario-name highway_v1.0 \
+  --duration-sec 60
+```
+
+如果需要接入外部仿真启动脚本，可使用命令模板：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_batch.py \
+  --execute \
+  --output-root /tmp/epsilon_batch_custom \
+  --scenario-name cut_in \
+  --run-command-template 'source {setup_bash} && ./run_one_case.sh {experiment_name} {config_path}'
+```
+
+常用占位符：
+
+```text
+{experiment_name}
+{scenario_name}
+{config_path}
+{playground}
+{planner_backend}
+{launch_file}
+{duration_sec}
+{risk_grid_csv}
+{risk_exposure_csv}
+{output_dir}
+{setup_bash}
+```
+
+`manifest.json` 会记录每组实验命令、配置路径、返回码、CSV 是否存在、summary 路径和 matrix 命令。
+如果实验命令返回成功但没有生成 risk grid CSV，该组会标记为 `data_missing`，不会静默进入最终矩阵。
+
+## 5. 单组实验汇总
 
 ```bash
 cd /home/ros/work/graduateworkcc/src/EPSILON
@@ -72,7 +144,7 @@ python3 util/ssc_planner/scripts/risk_experiment_report.py \
   --git-ref v0.9.0-mvp9-experiment-suite
 ```
 
-## 5. 多组实验矩阵
+## 6. 多组实验矩阵
 
 完成多组实验后，可用 `risk_experiment_matrix.py` 汇总多个 `summary.csv`：
 
@@ -94,7 +166,7 @@ matrix.json
 
 `matrix.csv` 每行对应一个实验组，列为常用论文指标，适合直接导入表格或绘图脚本。
 
-## 6. 输出文件
+## 7. 输出文件
 
 必定输出：
 
@@ -112,7 +184,7 @@ trajectory_exposure_max.png
 trajectory_risk_score.png
 ```
 
-## 7. 推荐消融实验分组
+## 8. 推荐消融实验分组
 
 ```text
 Baseline SSC
@@ -125,7 +197,7 @@ Adaptive risk weight
 Safety fallback
 ```
 
-## 8. 论文指标对应
+## 9. 论文指标对应
 
 ```text
 risk_grid.sum_risk              -> 风险图总体强度
@@ -153,7 +225,7 @@ safety_fallback_triggered_cycles -> 安全兜底触发的 planning cycle 数
 safety_fallback_switched_cycles -> 安全兜底触发并切换的 planning cycle 数
 ```
 
-## 9. 注意事项
+## 10. 注意事项
 
 脚本不参与 ROS 编译，不改变规划行为。它只读取 CSV 并写入离线报告文件，适合在每次实验运行后单独执行。
 

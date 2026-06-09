@@ -31,6 +31,7 @@ PROTOBUF_GENERATE_CPP(PROTO_SRCS PROTO_HDRS
 
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
+    scripts/risk_experiment_batch.py
     scripts/risk_experiment_report.py
     scripts/risk_experiment_matrix.py
     DESTINATION share/${PROJECT_NAME}/scripts
