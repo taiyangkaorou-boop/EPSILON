@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "description": "MVP-18 scripted risk actors: agent_4 performs a cut-in while using IDM longitudinal following with respect to the braking front vehicle agent_1.",
+  "actors": [
+    {
+      "id": 4,
+      "topic": "/ctrl/agent_4",
+      "mode": "idm_follow",
+      "idm_follow": {
+        "target_vehicle_id": 1,
+        "desired_velocity": 13.0,
+        "min_gap": 7.0,
+        "time_headway": 1.1,
+        "max_acc": 1.4,
+        "comfortable_brake": 2.6,
+        "delta": 4.0
+      },
+      "segments": [
+        {
+          "start": 0.5,
+          "end": 4.0,
+          "lon_acc": 0.0,
+          "lateral_offset": -2.8,
+          "final_heading_delta": -0.10
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "topic": "/ctrl/agent_1",
+      "mode": "open_loop",
+      "segments": [
+        {
+          "start": 1.0,
+          "end": 3.8,
+          "lon_acc": -1.5,
+          "lateral_offset": 0.0,
+          "final_heading_delta": 0.0
+        }
+      ]
+    }
+  ]
+}

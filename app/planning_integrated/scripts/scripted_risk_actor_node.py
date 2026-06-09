@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 import rclpy
 from rclpy.node import Node
+from vehicle_msgs.msg import ArenaInfoDynamic
 from vehicle_msgs.msg import ControlSignal
 
 
@@ -39,13 +40,28 @@ class ActorSegment:
 
 
 @dataclass(frozen=True)
+class IdmFollowConfig:
+    """IDM 纵向跟车参数，用于生成可复现的闭环周车反应。"""
+
+    target_vehicle_id: int
+    desired_velocity: float
+    min_gap: float
+    time_headway: float
+    max_acc: float
+    comfortable_brake: float
+    delta: float
+
+
+@dataclass(frozen=True)
 class ScriptedActor:
     """单辆脚本化风险周车的完整控制配置。"""
 
     actor_id: int
     topic: str
+    mode: str
     initial_state: ActorInitialState
     segments: List[ActorSegment]
+    idm_follow: Optional[IdmFollowConfig]
 
 
 def smoothstep(ratio: float) -> float:
@@ -99,6 +115,21 @@ def parse_segments(raw_segments: List[dict]) -> List[ActorSegment]:
     return segments
 
 
+def parse_idm_follow(raw_config: Optional[dict]) -> Optional[IdmFollowConfig]:
+    """解析 IDM 跟车配置；未配置时返回 None，保持旧脚本兼容。"""
+    if raw_config is None:
+        return None
+    return IdmFollowConfig(
+        target_vehicle_id=int(raw_config["target_vehicle_id"]),
+        desired_velocity=float(raw_config.get("desired_velocity", 12.0)),
+        min_gap=float(raw_config.get("min_gap", 6.0)),
+        time_headway=float(raw_config.get("time_headway", 1.2)),
+        max_acc=float(raw_config.get("max_acc", 1.5)),
+        comfortable_brake=float(raw_config.get("comfortable_brake", 2.0)),
+        delta=float(raw_config.get("delta", 4.0)),
+    )
+
+
 class ScriptedRiskActorNode(Node):
     """按照 JSON 脚本向 /ctrl/agent_{id} 发布开环 ControlSignal。"""
 
@@ -107,10 +138,12 @@ class ScriptedRiskActorNode(Node):
         self.declare_parameter("script_path", "")
         self.declare_parameter("vehicle_info_path", "")
         self.declare_parameter("publish_rate_hz", 50.0)
+        self.declare_parameter("arena_info_dynamic_topic", "/arena_info_dynamic")
 
         script_path = Path(self.get_parameter("script_path").value)
         vehicle_info_path = Path(self.get_parameter("vehicle_info_path").value)
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        arena_info_dynamic_topic = str(self.get_parameter("arena_info_dynamic_topic").value)
         if publish_rate_hz <= 0.0:
             raise ValueError("publish_rate_hz must be positive")
         if not script_path.exists():
@@ -124,6 +157,16 @@ class ScriptedRiskActorNode(Node):
             actor.actor_id: self.create_publisher(ControlSignal, actor.topic, 10)
             for actor in self.actors_
         }
+        self.latest_vehicle_states_: Dict[int, ActorInitialState] = {}
+        self.arena_info_dynamic_sub_ = self.create_subscription(
+            ArenaInfoDynamic,
+            arena_info_dynamic_topic,
+            self.on_arena_info_dynamic,
+            10,
+        )
+        self.last_publish_elapsed_: Dict[int, float] = {}
+        self.last_script_lateral_: Dict[int, float] = {}
+        self.last_script_heading_: Dict[int, float] = {}
         self.start_time_ = self.get_clock().now()
         self.timer_ = self.create_timer(1.0 / publish_rate_hz, self.on_timer)
         self.get_logger().info(
@@ -140,27 +183,43 @@ class ScriptedRiskActorNode(Node):
             actor_id = int(raw_actor["id"])
             if actor_id not in initial_states:
                 raise ValueError(f"actor id {actor_id} does not exist in vehicle_set.json")
+            mode = str(raw_actor.get("mode", "open_loop"))
+            idm_follow = parse_idm_follow(raw_actor.get("idm_follow"))
+            if mode == "idm_follow" and idm_follow is None:
+                raise ValueError(f"actor {actor_id} uses idm_follow without idm_follow config")
             actors.append(
                 ScriptedActor(
                     actor_id=actor_id,
                     topic=str(raw_actor.get("topic", f"/ctrl/agent_{actor_id}")),
+                    mode=mode,
                     initial_state=initial_states[actor_id],
                     segments=parse_segments(raw_actor.get("segments", [])),
+                    idm_follow=idm_follow,
                 )
             )
         if not actors:
             raise ValueError("risk actor script must contain at least one actor")
         return actors
 
-    def build_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
-        """根据当前时间生成开环状态消息，交给 phy_simulator 直接覆盖周车状态。"""
-        initial = actor.initial_state
-        msg = ControlSignal()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "map"
-        msg.is_openloop.data = True
+    def on_arena_info_dynamic(self, msg: ArenaInfoDynamic) -> None:
+        """缓存最新车辆状态，供 IDM actor 计算相对距离和相对速度。"""
+        latest_states: Dict[int, ActorInitialState] = {}
+        for vehicle in msg.vehicle_set.vehicles:
+            state = vehicle.state
+            latest_states[int(vehicle.id.data)] = ActorInitialState(
+                x=float(state.vec_position.x),
+                y=float(state.vec_position.y),
+                angle=float(state.angle),
+                curvature=float(state.curvature),
+                velocity=float(state.velocity),
+                acceleration=float(state.acceleration),
+                steer=float(state.steer),
+            )
+        self.latest_vehicle_states_ = latest_states
 
-        # 默认沿初始航向行驶；脚本段会累计改变速度、横向偏移和航向。
+    def scripted_offsets(self, actor: ScriptedActor, elapsed: float) -> tuple[float, float, float, float, float]:
+        """累计脚本段的纵向、横向、速度、加速度和航向偏移。"""
+        initial = actor.initial_state
         longitudinal = 0.0
         lateral = 0.0
         velocity = initial.velocity
@@ -189,7 +248,62 @@ class ScriptedRiskActorNode(Node):
             cursor_time = segment.end
         else:
             longitudinal += velocity * max(0.0, elapsed - cursor_time)
+        return longitudinal, lateral, velocity, acceleration, heading_delta
 
+    def idm_acceleration(self, actor: ScriptedActor) -> Optional[float]:
+        """根据最新动态场景计算 IDM 纵向加速度；状态不足时返回 None。"""
+        config = actor.idm_follow
+        if config is None:
+            return None
+        ego_state = self.latest_vehicle_states_.get(actor.actor_id)
+        target_state = self.latest_vehicle_states_.get(config.target_vehicle_id)
+        if ego_state is None or target_state is None:
+            return None
+
+        heading_x = math.cos(ego_state.angle)
+        heading_y = math.sin(ego_state.angle)
+        dx = target_state.x - ego_state.x
+        dy = target_state.y - ego_state.y
+        gap = dx * heading_x + dy * heading_y
+        if gap <= 0.1:
+            return -config.comfortable_brake
+
+        relative_velocity = ego_state.velocity - target_state.velocity
+        desired_velocity = max(0.1, config.desired_velocity)
+        sqrt_term = 2.0 * math.sqrt(config.max_acc * config.comfortable_brake)
+        desired_gap = config.min_gap + max(
+            0.0,
+            ego_state.velocity * config.time_headway
+            + ego_state.velocity * relative_velocity / max(0.1, sqrt_term),
+        )
+        free_road_term = (ego_state.velocity / desired_velocity) ** config.delta
+        interaction_term = (desired_gap / max(0.1, gap)) ** 2
+        acc = config.max_acc * (1.0 - free_road_term - interaction_term)
+        return min(config.max_acc, max(-config.comfortable_brake, acc))
+
+    def build_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+        """根据当前时间生成开环状态消息，交给 phy_simulator 直接覆盖周车状态。"""
+        if actor.mode == "open_loop":
+            return self.build_open_loop_signal(actor, elapsed)
+        if actor.mode == "idm_follow":
+            return self.build_idm_follow_signal(actor, elapsed)
+        raise ValueError(f"unsupported scripted risk actor mode: {actor.mode}")
+
+    def new_control_signal(self) -> ControlSignal:
+        """创建带 map 坐标系和当前时间戳的开环控制消息。"""
+        msg = ControlSignal()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.is_openloop.data = True
+        return msg
+
+    def build_open_loop_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+        """沿用 MVP-16 的开环脚本轨迹生成方式，保证旧场景完全兼容。"""
+        initial = actor.initial_state
+        msg = self.new_control_signal()
+        longitudinal, lateral, velocity, acceleration, heading_delta = self.scripted_offsets(
+            actor, elapsed
+        )
         cos_yaw = math.cos(initial.angle)
         sin_yaw = math.sin(initial.angle)
         msg.state.vec_position.x = initial.x + longitudinal * cos_yaw - lateral * sin_yaw
@@ -200,6 +314,44 @@ class ScriptedRiskActorNode(Node):
         msg.state.velocity = velocity
         msg.state.acceleration = acceleration
         msg.state.steer = initial.steer
+        return msg
+
+    def build_idm_follow_signal(self, actor: ScriptedActor, elapsed: float) -> ControlSignal:
+        """基于最新 arena_info_dynamic 做 IDM 纵向闭环，并叠加脚本横向偏移。"""
+        current = self.latest_vehicle_states_.get(actor.actor_id, actor.initial_state)
+        previous_elapsed = self.last_publish_elapsed_.get(actor.actor_id, elapsed)
+        dt = max(1.0e-3, elapsed - previous_elapsed)
+        _, lateral, _, scripted_acceleration, heading_delta = self.scripted_offsets(actor, elapsed)
+        previous_lateral = self.last_script_lateral_.get(actor.actor_id, 0.0)
+        previous_heading_delta = self.last_script_heading_.get(actor.actor_id, 0.0)
+        lateral_delta = lateral - previous_lateral
+        heading_delta_step = heading_delta - previous_heading_delta
+        self.last_publish_elapsed_[actor.actor_id] = elapsed
+        self.last_script_lateral_[actor.actor_id] = lateral
+        self.last_script_heading_[actor.actor_id] = heading_delta
+
+        idm_acc = self.idm_acceleration(actor)
+        acceleration = scripted_acceleration if idm_acc is None else idm_acc
+        velocity = max(0.0, current.velocity + acceleration * dt)
+        average_velocity = 0.5 * (current.velocity + velocity)
+
+        cos_yaw = math.cos(current.angle)
+        sin_yaw = math.sin(current.angle)
+        longitudinal_delta = average_velocity * dt
+
+        msg = self.new_control_signal()
+        msg.state.vec_position.x = (
+            current.x + longitudinal_delta * cos_yaw - lateral_delta * sin_yaw
+        )
+        msg.state.vec_position.y = (
+            current.y + longitudinal_delta * sin_yaw + lateral_delta * cos_yaw
+        )
+        msg.state.vec_position.z = 0.0
+        msg.state.angle = current.angle + heading_delta_step
+        msg.state.curvature = current.curvature
+        msg.state.velocity = velocity
+        msg.state.acceleration = acceleration
+        msg.state.steer = current.steer
         return msg
 
     def on_timer(self) -> None:
