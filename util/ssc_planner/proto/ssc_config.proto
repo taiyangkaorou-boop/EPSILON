@@ -7,6 +7,20 @@ message SscPlannerCfg {
   required double low_speed_threshold = 2;
   required double weight_proximity = 3;
   required bool is_fitting_only = 4;
+  // MVP-6: 是否计算候选 QP 轨迹的风险暴露指标。默认关闭，保持 baseline。
+  optional bool enable_risk_exposure_eval = 5 [default = false];
+  // MVP-6: 是否允许按风险暴露软代价重选候选轨迹。默认关闭，不改变最终轨迹。
+  optional bool enable_risk_exposure_reselect = 6 [default = false];
+  // MVP-6: 风险暴露代价权重。0.0 时即使打开重选也退化为原始行为选择。
+  optional double risk_exposure_weight = 7 [default = 0.0];
+  // MVP-6: 风险重选切换裕度，只有风险候选比 baseline 明显更优才允许切换。
+  optional double risk_exposure_switch_margin = 8 [default = 0.2];
+  // MVP-6: 沿 Bezier 候选轨迹查询 risk grid 的时间采样间隔。
+  optional double risk_exposure_sample_dt = 9 [default = 0.2];
+  // MVP-6: 单点风险超过该阈值时计入 high_risk_hits。
+  optional double risk_exposure_high_threshold = 10 [default = 0.5];
+  // MVP-6: 候选轨迹风险暴露 CSV 输出路径，用于论文实验复现。
+  optional string risk_exposure_csv_path = 11 [default = "/tmp/epsilon_mvp6_risk_exposure.csv"];
 }
 
 message InflateSteps {

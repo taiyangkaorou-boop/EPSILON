@@ -216,6 +216,48 @@ ErrorType SscMap::ResetRiskMap() {
   return kSuccess;
 }
 
+/// @brief 查询物理坐标 (s,d,t) 对应的风险值
+/// @return 对应栅格风险值；越界或异常时返回 0.0f
+/// @note MVP-6: 轨迹风险暴露评价需要在 Bezier 采样点上查询 risk grid。
+///       这里统一复用 GridMapND 的原点、分辨率和一维索引规则，避免 planner
+///       侧复制手写索引公式造成 s/d/t 轴错位。该函数只读风险图，不改变规划。
+RiskMapDataType SscMap::QueryRiskByMetricPosition(const decimal_t s,
+                                                  const decimal_t d,
+                                                  const decimal_t t) const {
+  return QueryRiskByMetricPositionInGrid(p_3d_risk_grid_, s, d, t);
+}
+
+/// @brief 在给定风险图快照中查询物理坐标 (s,d,t) 对应的风险值
+/// @return 对应栅格风险值；越界或异常时返回 0.0f
+/// @note 该函数集中处理物理坐标到一维风险图索引的映射，保证实时 risk grid 与
+///       MVP-6 候选快照使用同一套 GridMapND 原点、分辨率和展平索引规则。
+RiskMapDataType SscMap::QueryRiskByMetricPositionInGrid(
+    const RiskGridMap3D& risk_grid_snapshot, const decimal_t s,
+    const decimal_t d, const decimal_t t) const {
+  if (!p_3d_grid_ || p_3d_risk_grid_.empty()) {
+    return 0.0f;
+  }
+  if (risk_grid_snapshot.empty()) {
+    return 0.0f;
+  }
+
+  const std::array<decimal_t, 3> metric_position = {{s, d, t}};
+  const std::array<int, 3> coord =
+      p_3d_grid_->GetCoordUsingGlobalPosition(metric_position);
+
+  // 采样点落在 SSC map 外时视为无可用风险信息。这样不会因为边界外插打断规划。
+  if (!p_3d_grid_->CheckCoordInRange(coord)) {
+    return 0.0f;
+  }
+
+  const int mono_idx = p_3d_grid_->GetMonoIdxUsingNDimIdx(coord);
+  if (mono_idx < 0 || mono_idx >= static_cast<int>(risk_grid_snapshot.size())) {
+    return 0.0f;
+  }
+
+  return risk_grid_snapshot[mono_idx];
+}
+
 /// @brief 将高风险 cell 投影到原始二值占据图，使 corridor 避开高风险区域
 /// @return 被提升为 hard occupied 的风险栅格数量
 /// @note MVP-5: 这是 risk grid 第一次进入规划链路的位置。实现上不改 corridor

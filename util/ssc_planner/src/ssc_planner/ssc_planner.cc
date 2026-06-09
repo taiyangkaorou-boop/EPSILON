@@ -73,6 +73,8 @@
  *     a. 在有效轨迹中按优先级查找匹配行为:
  *        优先级1: 精确匹配 ego_behavior_ (如 LeftLaneChange)
  *        优先级2: 回退到 LaneKeeping 行为
+ *     a+. (MVP-6 可选) 对 QP 成功候选采样查询 risk grid, 计算 risk exposure
+ *        软代价；默认关闭，开启重选时也只在已有可行候选之间选择，不改 QP 约束。
  *     b. 将匹配的 Bezier 样条和 primitive 轨迹分别封装为
  *        FrenetBezierTrajectory 和 FrenetPrimitiveTrajectory
  *     c. 通过 trajectory() 方法：高速返回 Bezier 样条轨迹，
@@ -89,9 +91,12 @@
  */
 #include "ssc_planner/ssc_planner.h"
 
+#include <algorithm>
+#include <fstream>
 #include <glog/logging.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
 #include <google/protobuf/text_format.h>
+#include <iomanip>
 #include <omp.h>
 
 // ! 多核任务调度会显著影响性能，默认关闭OpenMP
@@ -117,12 +122,24 @@ ErrorType SscPlanner::Init(const std::string config_path) {
   // 打印规划器配置参数
   printf("\nSscPlanner Config:\n");
   printf(" -- weight_proximity: %lf\n", cfg_.planner_cfg().weight_proximity());
+  printf(" -- enable_risk_exposure_eval: %s\n",
+         cfg_.planner_cfg().enable_risk_exposure_eval() ? "true" : "false");
+  printf(" -- enable_risk_exposure_reselect: %s\n",
+         cfg_.planner_cfg().enable_risk_exposure_reselect() ? "true" : "false");
+  printf(" -- risk_exposure_weight: %lf\n",
+         cfg_.planner_cfg().risk_exposure_weight());
 
   LOG(INFO) << "[Ssc]SscPlanner Config:";
   LOG(INFO) << "[Ssc] -- low spd threshold: "
             << cfg_.planner_cfg().low_speed_threshold();
   LOG(INFO) << "[Ssc] -- weight_proximity: "
             << cfg_.planner_cfg().weight_proximity();
+  LOG(INFO) << "[Ssc] -- enable_risk_exposure_eval: "
+            << cfg_.planner_cfg().enable_risk_exposure_eval();
+  LOG(INFO) << "[Ssc] -- enable_risk_exposure_reselect: "
+            << cfg_.planner_cfg().enable_risk_exposure_reselect();
+  LOG(INFO) << "[Ssc] -- risk_exposure_weight: "
+            << cfg_.planner_cfg().risk_exposure_weight();
 
   // 第二步：构建 SscMap 配置并从 protobuf 映射参数
   SscMap::Config map_cfg;
@@ -321,6 +338,11 @@ ErrorType SscPlanner::RunOnce() {
 
   // 3b. 对每种行为: 构建地图并生成走廊
   int num_behaviors = forward_behaviors_.size();
+  const bool enable_risk_exposure_eval = IsRiskExposureEvaluationEnabled();
+  behavior_risk_grid_snapshots_.clear();
+  if (enable_risk_exposure_eval) {
+    behavior_risk_grid_snapshots_.reserve(static_cast<size_t>(num_behaviors));
+  }
   for (int i = 0; i < num_behaviors; ++i) {
     // 3b-i. 若非仅拟合模式 (is_fitting_only=false), 构建时空占据地图
     if (!cfg_.planner_cfg().is_fitting_only()) {
@@ -331,6 +353,16 @@ ErrorType SscPlanner::RunOnce() {
                                       multimodal_surround_trajs_fs_)) {
         LOG(ERROR) << "[Ssc]fail to construct ssc map.";
         return kWrongStatus;
+      }
+    }
+
+    // MVP-6: 每个行为的风险图在下一轮 ConstructSscMap 时会被清空重建，
+    // 因此必须在当前行为构图后立即保存快照，供后续 QP 候选 exposure 使用。
+    if (enable_risk_exposure_eval) {
+      if (cfg_.planner_cfg().is_fitting_only()) {
+        behavior_risk_grid_snapshots_.push_back(RiskGridMap3D());
+      } else {
+        behavior_risk_grid_snapshots_.push_back(p_ssc_map_->risk_grid());
       }
     }
 
@@ -445,6 +477,7 @@ ErrorType SscPlanner::RunQpOptimization() {
   valid_behaviors_.clear();
   corridors_.clear();
   ref_states_list_.clear();
+  candidate_risk_grid_snapshots_.clear();
 
   // 遍历每种行为的走廊，逐一优化
   for (int i = 0; i < static_cast<int>(cube_list.size()); i++) {
@@ -616,6 +649,14 @@ ErrorType SscPlanner::RunQpOptimization() {
     corridors_.push_back(cube_list[i]);
     ref_states_list_.push_back(ref_states);
     valid_behaviors_.push_back(forward_behaviors_[i]);
+    if (IsRiskExposureEvaluationEnabled()) {
+      if (i < static_cast<int>(behavior_risk_grid_snapshots_.size())) {
+        candidate_risk_grid_snapshots_.push_back(
+            behavior_risk_grid_snapshots_[static_cast<size_t>(i)]);
+      } else {
+        candidate_risk_grid_snapshots_.push_back(RiskGridMap3D());
+      }
+    }
   }
 
   return kSuccess;
@@ -640,31 +681,22 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
     return kWrongStatus;
   }
 
-  // Level 1: 查找精确匹配的行为
-  bool find_exact_match_behavior = false;
-  int index = 0;
-  for (int i = 0; i < num_valid_behaviors; i++) {
-    if (valid_behaviors_[i] == ego_behavior_) {
-      find_exact_match_behavior = true;
-      index = i;
-    }
-  }
-
-  // Level 2: 回退到 LaneKeeping
-  bool find_candidate_behavior = false;
-  LateralBehavior candidate_bahavior = common::LateralBehavior::kLaneKeeping;
-  if (!find_exact_match_behavior) {
-    for (int i = 0; i < num_valid_behaviors; i++) {
-      if (valid_behaviors_[i] == candidate_bahavior) {
-        find_candidate_behavior = true;
-        index = i;
-      }
-    }
-  }
-
-  // 两级别均未找到: 报告失败
-  if (!find_exact_match_behavior && !find_candidate_behavior)
+  // 先按原始 SSC 规则得到 baseline 候选。MVP-6 默认关闭时，最终仍使用该索引。
+  const int baseline_index = FindBaselineTrajectoryIndex();
+  if (baseline_index < 0) {
     return kWrongStatus;
+  }
+
+  int index = baseline_index;
+  std::vector<RiskExposureMetrics> risk_metrics;
+  if (IsRiskExposureEvaluationEnabled()) {
+    risk_metrics.reserve(static_cast<size_t>(num_valid_behaviors));
+    for (int i = 0; i < num_valid_behaviors; ++i) {
+      risk_metrics.push_back(ComputeRiskExposureForCandidate(i));
+    }
+    index = SelectRiskAwareTrajectoryIndex(baseline_index, risk_metrics);
+    AppendRiskExposureMetricsToCsv(risk_metrics, baseline_index, index);
+  }
 
   // 封装最终轨迹: 高速用 Bezier, 低速用 primitive
   trajectory_ = FrenetBezierTrajectory(qp_trajs_[index], stf_);
@@ -674,6 +706,223 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
   final_ref_states_ = ref_states_list_[index];
 
   return kSuccess;
+}
+
+/// @brief 按原始 SSC 两级策略查找候选轨迹索引
+/// @return 精确匹配 ego_behavior_ 或 LaneKeeping 回退的索引，找不到时返回 -1
+/// @note 该函数抽出原有逻辑，确保 MVP-6 风险重选关闭时不改变 baseline 行为。
+int SscPlanner::FindBaselineTrajectoryIndex() const {
+  const int num_valid_behaviors = static_cast<int>(valid_behaviors_.size());
+  int index = -1;
+
+  // Level 1: 精确匹配当前行为。若存在多个同类候选，沿用原实现的“后出现覆盖”语义。
+  for (int i = 0; i < num_valid_behaviors; i++) {
+    if (valid_behaviors_[i] == ego_behavior_) {
+      index = i;
+    }
+  }
+  if (index >= 0) {
+    return index;
+  }
+
+  // Level 2: 精确行为不可用时，回退到 LaneKeeping 作为安全候选。
+  const LateralBehavior candidate_behavior = common::LateralBehavior::kLaneKeeping;
+  for (int i = 0; i < num_valid_behaviors; i++) {
+    if (valid_behaviors_[i] == candidate_behavior) {
+      index = i;
+    }
+  }
+
+  return index;
+}
+
+/// @brief 计算单条 QP 候选轨迹的风险暴露
+/// @param candidate_index qp_trajs_ / valid_behaviors_ 中的候选索引
+/// @return 风险暴露统计
+/// @note MVP-6: 沿已求解成功的 Bezier 轨迹采样 (s,d,t)，从 risk grid 查询风险。
+///       这里不改变 Bezier 控制点，也不把风险写回 QP 目标或 corridor 约束。
+SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
+    const int candidate_index) const {
+  RiskExposureMetrics metrics;
+  metrics.candidate_index = candidate_index;
+  if (candidate_index < 0 || candidate_index >= static_cast<int>(qp_trajs_.size()) ||
+      candidate_index >= static_cast<int>(valid_behaviors_.size()) || !p_ssc_map_) {
+    return metrics;
+  }
+
+  metrics.behavior = valid_behaviors_[candidate_index];
+  const BezierSpline& candidate_traj = qp_trajs_[candidate_index];
+  const decimal_t begin_t = candidate_traj.begin();
+  const decimal_t end_t = candidate_traj.end();
+
+  // 采样步长做下限保护，避免配置为 0 或负数时进入死循环。
+  const decimal_t sample_dt =
+      std::max<decimal_t>(cfg_.planner_cfg().risk_exposure_sample_dt(), 1.0e-3);
+  const decimal_t high_threshold =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_high_threshold());
+
+  for (decimal_t t = begin_t; t <= end_t + kEPS; t += sample_dt) {
+    const decimal_t query_t = std::min(t, end_t);
+    Vecf<2> pos;
+    if (candidate_traj.evaluate(query_t, 0, &pos) != kSuccess) {
+      continue;
+    }
+
+    RiskMapDataType risk = 0.0f;
+    if (candidate_index <
+        static_cast<int>(candidate_risk_grid_snapshots_.size())) {
+      risk = p_ssc_map_->QueryRiskByMetricPositionInGrid(
+          candidate_risk_grid_snapshots_[static_cast<size_t>(candidate_index)],
+          pos[0], pos[1], query_t);
+    } else {
+      risk = p_ssc_map_->QueryRiskByMetricPosition(pos[0], pos[1], query_t);
+    }
+    metrics.exposure_sum += static_cast<decimal_t>(risk);
+    metrics.exposure_max =
+        std::max(metrics.exposure_max, static_cast<decimal_t>(risk));
+    if (static_cast<decimal_t>(risk) > high_threshold) {
+      ++metrics.high_risk_hits;
+    }
+    ++metrics.sample_count;
+  }
+
+  if (metrics.sample_count > 0) {
+    metrics.exposure_mean =
+        metrics.exposure_sum / static_cast<decimal_t>(metrics.sample_count);
+  }
+
+  metrics.risk_score =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_weight()) *
+      metrics.exposure_sum;
+  return metrics;
+}
+
+/// @brief 根据风险软代价选择候选轨迹
+/// @param baseline_index 原始 SSC 选择的候选索引
+/// @param metrics 所有候选轨迹的风险暴露统计
+/// @return 最终候选轨迹索引
+/// @note 重选是 soft ranking：只在 QP 已成功的候选集合中比较，不制造新轨迹。
+int SscPlanner::SelectRiskAwareTrajectoryIndex(
+    const int baseline_index,
+    const std::vector<RiskExposureMetrics>& metrics) const {
+  if (!cfg_.planner_cfg().enable_risk_exposure_reselect() ||
+      cfg_.planner_cfg().risk_exposure_weight() <= 0.0 || baseline_index < 0 ||
+      baseline_index >= static_cast<int>(metrics.size())) {
+    return baseline_index;
+  }
+
+  int risk_selected_index = baseline_index;
+  decimal_t best_score = metrics[baseline_index].risk_score;
+  for (const auto& metric : metrics) {
+    if (metric.candidate_index < 0 || metric.sample_count == 0) {
+      continue;
+    }
+    if (metric.risk_score < best_score) {
+      best_score = metric.risk_score;
+      risk_selected_index = metric.candidate_index;
+    }
+  }
+
+  const decimal_t baseline_score = metrics[baseline_index].risk_score;
+  const decimal_t switch_margin =
+      std::max<decimal_t>(0.0, cfg_.planner_cfg().risk_exposure_switch_margin());
+  if (risk_selected_index != baseline_index &&
+      baseline_score - best_score > switch_margin) {
+    LOG(WARNING) << "[Ssc][MVP6RiskReselect] baseline_behavior="
+                 << common::SemanticsUtils::RetLatBehaviorName(
+                        valid_behaviors_[baseline_index])
+                 << " selected_behavior="
+                 << common::SemanticsUtils::RetLatBehaviorName(
+                        valid_behaviors_[risk_selected_index])
+                 << " baseline_score=" << baseline_score
+                 << " selected_score=" << best_score
+                 << " switch_margin=" << switch_margin;
+    return risk_selected_index;
+  }
+
+  LOG(WARNING) << "[Ssc][MVP6RiskReselect] keep_baseline_behavior="
+               << common::SemanticsUtils::RetLatBehaviorName(
+                      valid_behaviors_[baseline_index])
+               << " baseline_score=" << baseline_score
+               << " best_score=" << best_score
+               << " switch_margin=" << switch_margin;
+  return baseline_index;
+}
+
+/// @brief 将候选轨迹风险暴露统计追加写入 CSV
+/// @param metrics 所有 QP 成功候选的风险暴露统计
+/// @param baseline_index 原始 SSC 选择的候选索引
+/// @param selected_index MVP-6 最终选择的候选索引
+/// @note CSV 用于论文实验复现；写入失败只记录 warning，不中断规划。
+void SscPlanner::AppendRiskExposureMetricsToCsv(
+    const std::vector<RiskExposureMetrics>& metrics,
+    const int baseline_index, const int selected_index) const {
+  const std::string csv_path = cfg_.planner_cfg().risk_exposure_csv_path();
+  if (csv_path.empty()) {
+    return;
+  }
+
+  bool csv_file_empty = true;
+  {
+    std::ifstream existing_file(csv_path);
+    csv_file_empty =
+        (!existing_file.good()) || (existing_file.peek() == std::ifstream::traits_type::eof());
+  }
+
+  std::ofstream csv_file(csv_path, std::ofstream::out | std::ofstream::app);
+  if (!csv_file.is_open()) {
+    LOG(WARNING) << "[Ssc][MVP6RiskExposureCsv] failed to open " << csv_path;
+    return;
+  }
+
+  if (csv_file_empty) {
+    csv_file << "cycle,stamp,candidate_index,behavior,is_baseline,is_selected,"
+                "sample_count,exposure_sum,exposure_mean,exposure_max,"
+                "high_risk_hits,risk_score\n";
+    risk_exposure_csv_header_written_ = true;
+  } else if (!risk_exposure_csv_header_written_) {
+    // 文件已有内容时认为 header 已存在，避免重复写入表头。
+    risk_exposure_csv_header_written_ = true;
+  }
+
+  const size_t current_cycle = risk_exposure_cycle_count_;
+  ++risk_exposure_cycle_count_;
+  for (const auto& metric : metrics) {
+    const bool is_baseline = metric.candidate_index == baseline_index;
+    const bool is_selected = metric.candidate_index == selected_index;
+    LOG(WARNING) << "[Ssc][MVP6RiskExposure] behavior="
+                 << common::SemanticsUtils::RetLatBehaviorName(metric.behavior)
+                 << " candidate_index=" << metric.candidate_index
+                 << " sample_count=" << metric.sample_count
+                 << " exposure_sum=" << metric.exposure_sum
+                 << " exposure_mean=" << metric.exposure_mean
+                 << " exposure_max=" << metric.exposure_max
+                 << " high_risk_hits=" << metric.high_risk_hits
+                 << " risk_score=" << metric.risk_score
+                 << " is_baseline=" << is_baseline
+                 << " is_selected=" << is_selected;
+
+    csv_file << current_cycle << "," << std::fixed << std::setprecision(4)
+             << stamp_ << "," << metric.candidate_index << ","
+             << common::SemanticsUtils::RetLatBehaviorName(metric.behavior) << ","
+             << (is_baseline ? 1 : 0) << "," << (is_selected ? 1 : 0) << ","
+             << metric.sample_count << "," << metric.exposure_sum << ","
+             << metric.exposure_mean << "," << metric.exposure_max << ","
+             << metric.high_risk_hits << "," << metric.risk_score << "\n";
+  }
+
+  if (!csv_file.good()) {
+    LOG(WARNING) << "[Ssc][MVP6RiskExposureCsv] failed to write " << csv_path;
+  }
+}
+
+/// @brief 判断是否启用 MVP-6 候选轨迹风险暴露评价
+/// @return true 表示需要保存 risk grid 快照并计算 exposure
+/// @note 默认配置下 eval/reselect 都为 false，因此不保存快照、不采样、不写 CSV，
+///       轨迹选择直接退回原始 SSC baseline。
+bool SscPlanner::IsRiskExposureEvaluationEnabled() const {
+  return cfg_.planner_cfg().enable_risk_exposure_eval() ||
+         cfg_.planner_cfg().enable_risk_exposure_reselect();
 }
 
 /// @brief 时空走廊可行性检查

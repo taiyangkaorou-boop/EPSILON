@@ -180,6 +180,29 @@ class SscMap {
   ///       高风险 cell 会被阈值化投影到 binary map，间接影响 corridor。
   const RiskGridMap3D& risk_grid() const { return p_3d_risk_grid_; }
 
+  /// @brief 查询物理坐标 (s,d,t) 对应的风险值
+  /// @param s Frenet 纵向坐标，单位 m
+  /// @param d Frenet 横向坐标，单位 m
+  /// @param t 轨迹时间戳，单位 s，与 SSC map 的时间原点一致
+  /// @return 对应栅格风险值 [0,1]；越界、地图未初始化或索引异常时返回 0
+  /// @note MVP-6: 该函数只读 p_3d_risk_grid_，用于候选轨迹风险暴露评价。
+  ///       它不修改 binary map、corridor 或 QP 约束，因此默认不影响规划可行性。
+  RiskMapDataType QueryRiskByMetricPosition(const decimal_t s,
+                                            const decimal_t d,
+                                            const decimal_t t) const;
+
+  /// @brief 在指定风险图快照中查询物理坐标 (s,d,t) 对应的风险值
+  /// @param risk_grid_snapshot 与当前 SSC map 同尺寸/同原点/同分辨率的风险图快照
+  /// @param s Frenet 纵向坐标，单位 m
+  /// @param d Frenet 横向坐标，单位 m
+  /// @param t 轨迹时间戳，单位 s，与 SSC map 的时间原点一致
+  /// @return 对应栅格风险值 [0,1]；越界、快照为空或索引异常时返回 0
+  /// @note MVP-6: 每个行为构图后会保存一份 risk grid 快照。候选轨迹评价必须使用
+  ///       与该候选行为对应的快照，不能误用最后一次 ConstructSscMap 残留的风险图。
+  RiskMapDataType QueryRiskByMetricPositionInGrid(
+      const RiskGridMap3D& risk_grid_snapshot, const decimal_t s,
+      const decimal_t d, const decimal_t t) const;
+
   /// @brief 计算风险占据栅格的统计信息（只读，不修改任何地图数据）
   /// @return RiskGridStats 结构体，包含 total/ nonzero/ max/ sum/ active_layers/ per_layer
   /// @note MVP-1A: 用于验证 risk grid 是否被正确 reset 和填充；该函数本身
