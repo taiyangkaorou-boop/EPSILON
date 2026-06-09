@@ -11,18 +11,21 @@
  *   1. SSC 时空占据地图 (VisualizeSscMap)
  *      - 三维体素栅格的障碍物占据情况
  *      - 参考车道区域边界框
- *   2. 自车当前位置 (VisualizeEgoVehicleInSscSpace)
+ *   2. 概率风险栅格 (VisualizeRiskGridInSscSpace)
+ *      - 仅可视化 risk grid 中超过阈值的体素
+ *      - 用颜色和透明度表达风险值，保持对规划链路只读
+ *   3. 自车当前位置 (VisualizeEgoVehicleInSscSpace)
  *      - Frenet 坐标下的车辆轮廓
  *      - 状态位置球体标记
- *   3. 前向仿真轨迹 (VisualizeForwardTrajectoriesInSscSpace)
+ *   4. 前向仿真轨迹 (VisualizeForwardTrajectoriesInSscSpace)
  *      - 各行为的多帧车辆轮廓 (渐变着色)
  *      - 各帧的 Frenet 状态位置标记
- *   4. 周围车辆预测轨迹 (VisualizeSurroundingVehicleTrajInSscSpace)
+ *   5. 周围车辆预测轨迹 (VisualizeSurroundingVehicleTrajInSscSpace)
  *      - 周围车辆的多帧轮廓
- *   5. 时空走廊 (VisualizeCorridorsInSscSpace)
+ *   6. 时空走廊 (VisualizeCorridorsInSscSpace)
  *      - 走廊中的种子点 (球体)
  *      - 膨胀后的立方体边界 (半透明)
- *   6. QP 优化轨迹 (VisualizeQpTrajs)
+ *   7. QP 优化轨迹 (VisualizeQpTrajs)
  *      - (s, d, t) 空间中的 Bezier 样条曲线
  *
  * [坐标系映射]
@@ -74,6 +77,9 @@ class SscVisualizer {
   /// @brief 可视化 SSC 三维占据栅格地图
   void VisualizeSscMap(const rclcpp::Time &stamp, const SscMap *p_ssc_map);
 
+  /// @brief 可视化概率风险栅格，仅作为论文实验和 RViz 调试侧通道
+  void VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp, const SscMap *p_ssc_map);
+
   /// @brief 可视化自车在 SSC 空间 (s,d,t) 中的位置和轮廓
   void VisualizeEgoVehicleInSscSpace(const rclcpp::Time &stamp, const common::FsVehicle &fs_ego_vehicle);
 
@@ -110,6 +116,8 @@ class SscVisualizer {
 
   /// SSC 占据栅格地图可视化发布者
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ssc_map_pub_;
+  /// 概率风险栅格可视化发布者
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr risk_grid_pub_;
   /// 自车 Frenet 位置可视化发布者
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ego_vehicle_pub_;
   /// 前向轨迹可视化发布者
@@ -123,6 +131,7 @@ class SscVisualizer {
 
   int last_corridor_mk_cnt = 0;       ///< 上一帧走廊 Marker 数量
   int last_qp_traj_mk_cnt = 0;        ///< 上一帧 QP 轨迹 Marker 数量
+  int last_risk_grid_mk_cnt = 0;       ///< 上一帧风险栅格 Marker 数量
   int last_sur_vehicle_traj_mk_cnt = 0; ///< 上一帧周围车辆轨迹 Marker 数量
   int last_forward_traj_mk_cnt = 0;    ///< 上一帧前向轨迹 Marker 数量
 };  // SscVisualizer

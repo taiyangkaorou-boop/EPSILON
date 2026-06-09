@@ -12,6 +12,7 @@
  *
  * [可视化内容及话题]
  *   /vis/agent_{id}/ssc/map_vis            : SSC 三维占据栅格地图
+ *   /vis/agent_{id}/ssc/risk_grid_vis      : 概率风险栅格地图
  *   /vis/agent_{id}/ssc/ego_fs_vis         : 自车在 Frenet 空间的位置和轮廓
  *   /vis/agent_{id}/ssc/forward_trajs_vis  : 各行为的前向仿真轨迹
  *   /vis/agent_{id}/ssc/qp_vis             : QP 优化的 Bezier 样条轨迹
@@ -24,6 +25,8 @@
  *   确保新帧不会残留旧帧的 Marker 片段。
  */
 #include "ssc_planner/ssc_visualizer.h"
+
+#include <algorithm>
 
 namespace planning {
 
@@ -38,6 +41,9 @@ SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
   std::string ssc_map_vis_topic = std::string("/vis/agent_") +
                                   std::to_string(node_id_) +
                                   std::string("/ssc/map_vis");
+  std::string risk_grid_vis_topic = std::string("/vis/agent_") +
+                                    std::to_string(node_id_) +
+                                    std::string("/ssc/risk_grid_vis");
   std::string ego_vehicle_vis_topic = std::string("/vis/agent_") +
                                       std::to_string(node_id_) +
                                       std::string("/ssc/ego_fs_vis");
@@ -56,6 +62,7 @@ SscVisualizer::SscVisualizer(rclcpp::Node::SharedPtr node, int node_id)
 
   // 创建发布者 (latch=false, QoS depth=1)
   ssc_map_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(ssc_map_vis_topic, 1);
+  risk_grid_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(risk_grid_vis_topic, 1);
   qp_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(qp_vis_topic, 1);
   ego_vehicle_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(ego_vehicle_vis_topic, 1);
   forward_trajs_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(forward_trajs_vis_topic, 1);
@@ -69,6 +76,7 @@ void SscVisualizer::VisualizeDataWithStamp(const rclcpp::Time &stamp,
   start_time_ = planner.time_origin();  // 记录时间原点用于计算相对时间
 
   VisualizeSscMap(stamp, planner.p_ssc_map());
+  VisualizeRiskGridInSscSpace(stamp, planner.p_ssc_map());
   VisualizeEgoVehicleInSscSpace(stamp, planner.fs_ego_vehicle());
   VisualizeForwardTrajectoriesInSscSpace(stamp, planner.forward_trajs_fs(),
                                          planner.p_ssc_map());
@@ -165,6 +173,106 @@ void SscVisualizer::VisualizeSscMap(const rclcpp::Time &stamp,
   map_marker_arr.markers.push_back(map_marker);
   map_marker_arr.markers.push_back(map_aabb_marker);
   ssc_map_pub_->publish(map_marker_arr);
+}
+
+/// @brief 可视化概率风险栅格地图
+///
+/// risk grid 当前是 SSC map 的并行调试侧通道，本函数只读 risk_grid()
+/// 并发布 RViz Marker，不回写二值占据图、不影响 corridor/QP/control。
+/// 坐标语义保持与 SSC map 一致：
+///   - X = s 栅格中心
+///   - Y = d 栅格中心
+///   - Z = t - start_time_，仅用于时空调试图中的相对时间高度
+void SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp,
+                                                const SscMap *p_ssc_map) {
+  visualization_msgs::msg::MarkerArray risk_marker_arr;
+  visualization_msgs::msg::Marker risk_marker;
+  risk_marker.ns = "risk_grid";
+  risk_marker.type = visualization_msgs::msg::Marker::CUBE_LIST;
+  risk_marker.action = visualization_msgs::msg::Marker::MODIFY;
+  risk_marker.pose.orientation.w = 1.0;
+
+  if (p_ssc_map == nullptr || p_ssc_map->p_3d_grid() == nullptr) {
+    // 空地图时仍发布空 marker，用相同 id 覆盖上一帧内容，避免 RViz 残留。
+    risk_marker_arr.markers.push_back(risk_marker);
+    common::VisualizationUtil::FillHeaderIdInMarkerArray(
+        stamp, std::string("ssc_map"), last_risk_grid_mk_cnt, &risk_marker_arr);
+    risk_grid_pub_->publish(risk_marker_arr);
+    last_risk_grid_mk_cnt = 1;
+    return;
+  }
+
+  const auto *p_grid = p_ssc_map->p_3d_grid();
+  const auto &risk_grid = p_ssc_map->risk_grid();
+  const auto &dims_size = p_grid->dims_size();
+  const auto &dims_resolution = p_grid->dims_resolution();
+
+  // MVP-1C 只做调试可视化：阈值取极小正数，确保 MVP-0/1A 中固定 1.0 的风险能显示。
+  constexpr float kRiskGridVisualizationThreshold = 1.0e-6f;
+  // 限制时间层和总体点数，避免默认 1000*100*81 体素全量发布拖慢 RViz/DDS。
+  constexpr int kMaxRiskGridVisualizationLayers = 20;
+  constexpr int kMaxRiskGridVisualizationCells = 5000;
+
+  const int s_dim = dims_size[0];
+  const int d_dim = dims_size[1];
+  const int t_dim = dims_size[2];
+  const int layer_cell_num = s_dim * d_dim;
+  const int visualized_t_dim = std::min(t_dim, kMaxRiskGridVisualizationLayers);
+
+  risk_marker.scale.x = dims_resolution[0];
+  risk_marker.scale.y = dims_resolution[1];
+  risk_marker.scale.z = dims_resolution[2];
+  risk_marker.points.reserve(kMaxRiskGridVisualizationCells);
+  risk_marker.colors.reserve(kMaxRiskGridVisualizationCells);
+
+  int visualized_cells = 0;
+  for (int t_idx = 0; t_idx < visualized_t_dim; ++t_idx) {
+    for (int d_idx = 0; d_idx < d_dim; ++d_idx) {
+      for (int s_idx = 0; s_idx < s_dim; ++s_idx) {
+        const int risk_idx = t_idx * layer_cell_num + d_idx * s_dim + s_idx;
+        if (risk_idx >= static_cast<int>(risk_grid.size())) break;
+
+        const float risk = risk_grid[risk_idx];
+        if (risk <= kRiskGridVisualizationThreshold) continue;
+
+        // 风险栅格沿用 SscMap 的一维布局：idx = t*s_dim*d_dim + d*s_dim + s。
+        std::array<int, 3> coord = {s_idx, d_idx, t_idx};
+        std::array<decimal_t, 3> p_w;
+        p_grid->GetGlobalPositionUsingCoordinate(coord, &p_w);
+
+        geometry_msgs::msg::Point pt;
+        pt.x = p_w[0];
+        pt.y = p_w[1];
+        pt.z = p_w[2] - start_time_;
+        risk_marker.points.push_back(pt);
+
+        const float clamped_risk = std::min(std::max(risk, 0.0f), 1.0f);
+        const float time_ratio = visualized_t_dim > 1
+                                     ? static_cast<float>(t_idx) /
+                                           static_cast<float>(visualized_t_dim - 1)
+                                     : 0.0f;
+        std_msgs::msg::ColorRGBA color;
+        color.r = 1.0f;
+        color.g = 1.0f - clamped_risk;
+        color.b = 0.05f * (1.0f - clamped_risk);
+        // 风险越高越不透明，时间层越远越透明，便于观察近时域高风险。
+        color.a = 0.15f + 0.70f * clamped_risk * (1.0f - 0.50f * time_ratio);
+        risk_marker.colors.push_back(color);
+
+        ++visualized_cells;
+        if (visualized_cells >= kMaxRiskGridVisualizationCells) break;
+      }
+      if (visualized_cells >= kMaxRiskGridVisualizationCells) break;
+    }
+    if (visualized_cells >= kMaxRiskGridVisualizationCells) break;
+  }
+
+  risk_marker_arr.markers.push_back(risk_marker);
+  const int num_markers = static_cast<int>(risk_marker_arr.markers.size());
+  common::VisualizationUtil::FillHeaderIdInMarkerArray(
+      stamp, std::string("ssc_map"), last_risk_grid_mk_cnt, &risk_marker_arr);
+  risk_grid_pub_->publish(risk_marker_arr);
+  last_risk_grid_mk_cnt = num_markers;
 }
 
 /// @brief 可视化自车在 SSC 空间中的位置
