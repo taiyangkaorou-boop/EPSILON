@@ -39,4 +39,10 @@ map_cfg {
     z_p: 1
     z_n: 1
   }
+
+  # MVP-5: 风险感知 corridor 默认关闭，保持原始 SSC baseline 行为。
+  enable_risk_aware_corridor: false
+  # MVP-5: risk > threshold 的 cell 会被提升为 hard occupied。
+  # 默认 1.0 且使用严格大于判断，因此不会新增风险占据格。
+  risk_occupied_threshold: 1.0
 }
