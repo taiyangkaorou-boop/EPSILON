@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -140,10 +140,34 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
 {risk_exposure_csv}
 {output_dir}
 {setup_bash}
+{enable_scripted_risk_actors}
+{risk_actor_script_path}
+{risk_actor_publish_rate_hz}
 ```
 
 `manifest.json` 会记录每组实验命令、配置路径、返回码、CSV 是否存在、summary 路径和 matrix 命令。
 如果实验命令返回成功但没有生成 risk grid CSV，该组会标记为 `data_missing`，不会静默进入最终矩阵。
+
+MVP-16 新增脚本化周车控制。若 playground 目录中存在 `risk_actor_script.json`，
+`risk_experiment_batch.py` 会自动给闭环 launch 传入：
+
+```text
+enable_scripted_risk_actors:=true
+risk_actor_script_path:=<playground>/risk_actor_script.json
+```
+
+也可以显式启用或覆盖脚本路径：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_batch.py \
+  --execute \
+  --scenario-name risk_scripted_cut_in_v1.0 \
+  --enable-scripted-risk-actors \
+  --duration-sec 60
+```
+
+脚本 actor 通过 `/ctrl/agent_{id}` 发布开环 `ControlSignal`，只改变实验场景中的周车运动，
+不修改 SSC、EUDM、MPDM、QP 或 phy_simulator 的车辆更新逻辑。
 
 ## 5. 多场景实验套件
 
@@ -164,6 +188,7 @@ highway_lite
 risk_dense_following_v1.0
 risk_merge_pressure_v1.0
 risk_lane_change_conflict_v1.0
+risk_scripted_cut_in_v1.0
 ring_small_v1.0
 ring_tiny_v1.0
 ```
@@ -178,13 +203,17 @@ highway_lite/
 risk_dense_following_v1.0/
 risk_merge_pressure_v1.0/
 risk_lane_change_conflict_v1.0/
+risk_scripted_cut_in_v1.0/
 ring_small_v1.0/
 ring_tiny_v1.0/
 ```
 
-其中 `risk_*` 场景来自 MVP-15。它们复用 `highway_lite` 路网和障碍物，
+其中 `risk_dense_following_v1.0`、`risk_merge_pressure_v1.0`、
+`risk_lane_change_conflict_v1.0` 来自 MVP-15。它们复用 `highway_lite` 路网和障碍物，
 只调整车辆初始位置、速度和相对密度，用于形成高风险初始交通态。
 这些场景不包含主动 cut-in 控制器，论文中应表述为“高密度/相对速度风险场景”。
+`risk_scripted_cut_in_v1.0` 来自 MVP-16，额外包含 `risk_actor_script.json`，
+会启动脚本化周车控制器制造可复现的主动切入/制动压力场景。
 
 显式执行：
 

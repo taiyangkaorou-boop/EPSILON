@@ -64,6 +64,21 @@ def generate_launch_description():
             "ssc_config.pb.txt",
         ]),
     )
+    # MVP-16: 默认不启动脚本化周车；批量实验或指定场景可显式打开。
+    enable_scripted_risk_actors = DeclareLaunchArgument(
+        "enable_scripted_risk_actors", default_value="false"
+    )
+    risk_actor_script_path = DeclareLaunchArgument(
+        "risk_actor_script_path",
+        default_value=PathJoinSubstitution([
+            get_package_share_directory("playgrounds"),
+            LaunchConfiguration("playground"),
+            "risk_actor_script.json",
+        ]),
+    )
+    risk_actor_publish_rate_hz = DeclareLaunchArgument(
+        "risk_actor_publish_rate_hz", default_value="50.0"
+    )
 
     # 批量实验不依赖物理手柄，直接启动仿真节点，避免 joy_node 在无手柄机器上失败。
     vehicle_info_path = PathJoinSubstitution([
@@ -96,6 +111,18 @@ def generate_launch_description():
             ("arena_info_dynamic", LaunchConfiguration("arena_info_dynamic_topic")),
         ],
     )
+    scripted_risk_actor_node = Node(
+        package="planning_integrated",
+        executable="scripted_risk_actor_node.py",
+        name="scripted_risk_actor_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("enable_scripted_risk_actors")),
+        parameters=[{
+            "script_path": LaunchConfiguration("risk_actor_script_path"),
+            "vehicle_info_path": vehicle_info_path,
+            "publish_rate_hz": LaunchConfiguration("risk_actor_publish_rate_hz"),
+        }],
+    )
 
     planning_launch_arguments = {
         "arena_info_static_topic": LaunchConfiguration("arena_info_static_topic"),
@@ -122,14 +149,20 @@ def generate_launch_description():
         planner_backend,
         playground,
         ssc_config_path,
+        enable_scripted_risk_actors,
+        risk_actor_script_path,
+        risk_actor_publish_rate_hz,
         LogInfo(msg=["planner_backend: ", LaunchConfiguration("planner_backend")]),
         LogInfo(msg=["playground: ", LaunchConfiguration("playground")]),
         LogInfo(msg=["ssc_config_path: ", LaunchConfiguration("ssc_config_path")]),
+        LogInfo(msg=["enable_scripted_risk_actors: ", LaunchConfiguration("enable_scripted_risk_actors")]),
+        LogInfo(msg=["risk_actor_script_path: ", LaunchConfiguration("risk_actor_script_path")]),
         LogInfo(msg=["vehicle_info_path: ", vehicle_info_path]),
         LogInfo(msg=["map_path: ", map_path]),
         LogInfo(msg=["lane_net_path: ", lane_net_path]),
         LogInfo(msg="Launching closed-loop risk experiment..."),
         simulator_node,
+        scripted_risk_actor_node,
         eudm_planning_launch,
         mpdm_planning_launch,
     ])

@@ -26,6 +26,7 @@ DEFAULT_SCENARIOS = [
     "risk_dense_following_v1.0",
     "risk_merge_pressure_v1.0",
     "risk_lane_change_conflict_v1.0",
+    "risk_scripted_cut_in_v1.0",
     "ring_small_v1.0",
     "ring_tiny_v1.0",
 ]
@@ -112,6 +113,13 @@ def build_batch_command(
         command.extend(["--experiment", experiment])
     if args.git_ref:
         command.extend(["--git-ref", args.git_ref])
+    if args.enable_scripted_risk_actors:
+        command.append("--enable-scripted-risk-actors")
+    if args.risk_actor_publish_rate_hz:
+        command.extend([
+            "--risk-actor-publish-rate-hz",
+            str(args.risk_actor_publish_rate_hz),
+        ])
     if args.execute:
         command.append("--execute")
     if args.continue_on_error:
@@ -148,7 +156,7 @@ def write_shell_plan(plan_path: Path, commands: Iterable[List[str]]) -> None:
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "# MVP-14 dry-run 生成的多场景实验计划。",
+        "# MVP-14/MVP-16 dry-run 生成的多场景实验计划。",
         "# 每条命令会继续调用 risk_experiment_batch.py；默认仍为 dry-run。",
         "",
     ]
@@ -168,7 +176,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--scenario",
         action="append",
         default=[],
-        help="要运行的 playground 名称；可重复。不填写时使用内置四个场景。",
+        help="要运行的 playground 名称；可重复。不填写时使用内置默认场景集。",
     )
     parser.add_argument(
         "--experiment",
@@ -207,6 +215,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--git-ref",
         default="",
         help="透传给 batch runner 的代码版本字段。",
+    )
+    parser.add_argument(
+        "--enable-scripted-risk-actors",
+        action="store_true",
+        help="强制所有场景启用 MVP-16 脚本化周车；默认由 batch runner 按场景脚本自动判断。",
+    )
+    parser.add_argument(
+        "--risk-actor-publish-rate-hz",
+        type=float,
+        default=50.0,
+        help="透传给脚本化周车节点的控制信号发布频率。",
     )
     parser.add_argument(
         "--setup-bash",
