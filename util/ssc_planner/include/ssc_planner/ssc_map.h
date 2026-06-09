@@ -194,11 +194,13 @@ class SscMap {
   ///
   /// @param sur_vehicle_trajs_fs 周围车辆在 Frenet 坐标下的预测轨迹
   /// @param obstacle_grids       静态障碍物栅格的 Frenet 坐标列表
+  /// @param traj_probs           周车轨迹存在概率表，key=车辆ID
   /// @return 错误码
   ErrorType ConstructSscMap(
       const std::unordered_map<int, vec_E<common::FsVehicle>>
           &sur_vehicle_trajs_fs,
-      const vec_E<Vec2f> &obstacle_grids);
+      const vec_E<Vec2f> &obstacle_grids,
+      const std::unordered_map<int, decimal_t> &traj_probs);
 
   /// @brief 对障碍物栅格进行车辆尺寸膨胀
   /// 根据车辆参数（长、宽、后轴到车尾距离）计算膨胀量并填充 p_3d_inflated_grid_
@@ -350,12 +352,14 @@ class SscMap {
   /// @brief 概率化填充动态障碍物 —— 遍历所有周围车辆并将其预测轨迹写入风险占据图
   /// @param sur_vehicle_trajs_fs 周围车辆在 Frenet 坐标系下的预测轨迹
   ///                              (key=车辆ID, value=Frenet车辆状态序列)
+  /// @param traj_probs           周车轨迹存在概率表，缺失时回退到 1.0
   /// @return kSuccess
   /// @note 与 FillDynamicPart 的区别：写入 p_3d_risk_grid_（float概率）而非
-  ///       p_3d_grid_（uint8_t二值占据）。MVP-0 中 existence_prob 固定为 1.0f
+  ///       p_3d_grid_（uint8_t二值占据）。MVP-2 只影响 risk grid。
   ErrorType FillDynamicPartProbabilistic(
       const std::unordered_map<int, vec_E<common::FsVehicle>>
-          &sur_vehicle_trajs_fs);
+          &sur_vehicle_trajs_fs,
+      const std::unordered_map<int, decimal_t> &traj_probs);
 
   /// @brief 将单条 Frenet 车辆轨迹填充到 3D 栅格
   ///
@@ -365,12 +369,13 @@ class SscMap {
 
   /// @brief 概率化填充单条车辆 Frenet 轨迹到风险占据图
   /// @param traj 单辆周围车辆在 Frenet 坐标系下的完整预测轨迹
+  /// @param existence_prob 该条确定性轨迹写入 risk grid 的存在概率
   /// @return kSuccess 填充成功 / kWrongStatus 轨迹为空
   /// @note 复用原始 FillMapWithFsVehicleTraj 的几何流程（坐标转换、范围检查、
   ///       OpenCV fillPoly），但写入目标为 p_3d_risk_grid_（CV_32FC1），
-  ///       填充值为 existence_prob（MVP-0 固定 1.0f）
+  ///       填充值为 existence_prob（MVP-2 来自行车 argmax 行为概率）
   ErrorType FillMapWithFsVehicleTrajProbabilistic(
-      const vec_E<common::FsVehicle> traj);
+      const vec_E<common::FsVehicle> traj, const float existence_prob);
 
   // =========================================================================
   // 成员变量

@@ -88,6 +88,10 @@ class SscPlannerAdapter : public SscPlannerMapItf {
       vec_E<std::unordered_map<int, vec_E<common::Vehicle>>>* sur_trajs)
       override;
 
+  /// @brief 获取周围车辆当前确定性预测轨迹的存在概率
+  ErrorType GetSurroundingTrajectoryExistenceProbabilities(
+      std::unordered_map<int, decimal_t>* traj_probs) override;
+
   /// @brief 获取障碍物占据栅格集合
   ErrorType GetObstacleGrids(
       std::set<std::array<decimal_t, 2>>* obs_grids) override;
