@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -145,7 +145,65 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
 `manifest.json` 会记录每组实验命令、配置路径、返回码、CSV 是否存在、summary 路径和 matrix 命令。
 如果实验命令返回成功但没有生成 risk grid CSV，该组会标记为 `data_missing`，不会静默进入最终矩阵。
 
-## 5. 单组实验汇总
+## 5. 多场景实验套件
+
+MVP-14 新增 `risk_experiment_scenario_suite.py`，用于在多个 playground 上重复调用
+`risk_experiment_batch.py`。默认只生成 dry-run 计划：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_scenario_suite.py \
+  --output-root /tmp/epsilon_scenario_suite \
+  --duration-sec 60
+```
+
+默认场景：
+
+```text
+highway_v1.0
+highway_lite
+ring_small_v1.0
+ring_tiny_v1.0
+```
+
+输出：
+
+```text
+scenario_suite_manifest.json
+scenario_run_plan.sh
+highway_v1.0/
+highway_lite/
+ring_small_v1.0/
+ring_tiny_v1.0/
+```
+
+显式执行：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_scenario_suite.py \
+  --execute \
+  --output-root /tmp/epsilon_scenario_suite \
+  --duration-sec 60
+```
+
+只跑指定场景：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_scenario_suite.py \
+  --scenario highway_v1.0 \
+  --scenario highway_lite \
+  --output-root /tmp/epsilon_highway_suite
+```
+
+执行模式下，若单场景 batch 成功生成 matrix，脚本会把该场景的 `matrix.csv`
+复制到：
+
+```text
+matrix_by_scenario/<scenario>.csv
+```
+
+这样可以直接按场景比较同一批消融实验的风险指标。
+
+## 6. 单组实验汇总
 
 ```bash
 cd /home/ros/work/graduateworkcc/src/EPSILON
@@ -158,7 +216,7 @@ python3 util/ssc_planner/scripts/risk_experiment_report.py \
   --git-ref v0.9.0-mvp9-experiment-suite
 ```
 
-## 6. 多组实验矩阵
+## 7. 多组实验矩阵
 
 完成多组实验后，可用 `risk_experiment_matrix.py` 汇总多个 `summary.csv`：
 
@@ -180,7 +238,7 @@ matrix.json
 
 `matrix.csv` 每行对应一个实验组，列为常用论文指标，适合直接导入表格或绘图脚本。
 
-## 7. 输出文件
+## 8. 输出文件
 
 必定输出：
 
@@ -198,7 +256,7 @@ trajectory_exposure_max.png
 trajectory_risk_score.png
 ```
 
-## 8. 推荐消融实验分组
+## 9. 推荐消融实验分组
 
 ```text
 Baseline SSC
@@ -211,7 +269,7 @@ Adaptive risk weight
 Safety fallback
 ```
 
-## 9. 论文指标对应
+## 10. 论文指标对应
 
 ```text
 risk_grid.sum_risk              -> 风险图总体强度
