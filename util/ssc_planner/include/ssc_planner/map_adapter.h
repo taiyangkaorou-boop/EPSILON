@@ -92,6 +92,10 @@ class SscPlannerAdapter : public SscPlannerMapItf {
   ErrorType GetSurroundingTrajectoryExistenceProbabilities(
       std::unordered_map<int, decimal_t>* traj_probs) override;
 
+  /// @brief 获取周围车辆多模态预测轨迹，供 SSC risk grid 使用
+  ErrorType GetMultiModalSurroundingTrajectories(
+      MultiModalSurroundingTrajectories* multimodal_trajs) override;
+
   /// @brief 获取障碍物占据栅格集合
   ErrorType GetObstacleGrids(
       std::set<std::array<decimal_t, 2>>* obs_grids) override;

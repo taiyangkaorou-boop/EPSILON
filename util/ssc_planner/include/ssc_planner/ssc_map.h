@@ -60,6 +60,19 @@ using RiskMapDataType = float;
 ///       避免对 common 库的额外模板实例化
 using RiskGridMap3D = std::vector<RiskMapDataType>;
 
+/// @brief Frenet 坐标系下的周围车辆多模态预测轨迹
+/// @note MVP-3 中该结构只服务 risk grid，不参与 binary map/corridor/QP。
+struct SurroundingVehicleFsTrajectoryMode {
+  int vehicle_id = kInvalidAgentId;  ///< 周围车辆 ID
+  common::LateralBehavior lat_behavior{common::LateralBehavior::kUndefined};  ///< 该模态横向行为
+  decimal_t probability{0.0};  ///< 该模态概率
+  vec_E<common::FsVehicle> traj;  ///< Frenet 坐标系下的预测轨迹
+};
+
+/// @brief 周围车辆多模态 Frenet 预测轨迹集合，key=车辆ID
+using MultiModalSurroundingFsTrajectories =
+    std::unordered_map<int, vec_E<SurroundingVehicleFsTrajectoryMode>>;
+
 /// @brief 风险占据栅格统计结构 —— 用于 MVP-1A 验证风险图是否被正确填充和重置
 /// @note 由 ComputeRiskGridStats() 填充，PrintRiskGridStatsIfNeeded() 输出日志。
 ///       该结构不参与任何规划决策，仅用于调试和验证
@@ -195,12 +208,14 @@ class SscMap {
   /// @param sur_vehicle_trajs_fs 周围车辆在 Frenet 坐标下的预测轨迹
   /// @param obstacle_grids       静态障碍物栅格的 Frenet 坐标列表
   /// @param traj_probs           周车轨迹存在概率表，key=车辆ID
+  /// @param multimodal_trajs_fs  周车多模态 Frenet 轨迹，仅写入 risk grid
   /// @return 错误码
   ErrorType ConstructSscMap(
       const std::unordered_map<int, vec_E<common::FsVehicle>>
           &sur_vehicle_trajs_fs,
       const vec_E<Vec2f> &obstacle_grids,
-      const std::unordered_map<int, decimal_t> &traj_probs);
+      const std::unordered_map<int, decimal_t> &traj_probs,
+      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs);
 
   /// @brief 对障碍物栅格进行车辆尺寸膨胀
   /// 根据车辆参数（长、宽、后轴到车尾距离）计算膨胀量并填充 p_3d_inflated_grid_
@@ -360,6 +375,12 @@ class SscMap {
       const std::unordered_map<int, vec_E<common::FsVehicle>>
           &sur_vehicle_trajs_fs,
       const std::unordered_map<int, decimal_t> &traj_probs);
+
+  /// @brief 概率化填充多模态动态障碍物，仅写入风险占据图
+  /// @param multimodal_trajs_fs 周围车辆多模态 Frenet 轨迹集合
+  /// @return kSuccess
+  ErrorType FillDynamicPartProbabilistic(
+      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs);
 
   /// @brief 将单条 Frenet 车辆轨迹填充到 3D 栅格
   ///

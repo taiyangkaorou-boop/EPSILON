@@ -293,6 +293,8 @@ class SscPlanner : public Planner {
   std::vector<LateralBehavior> forward_behaviors_;
   /// 各行为下的周围车辆前向仿真轨迹 [behavior_idx][vehicle_id] = trajectory
   vec_E<std::unordered_map<int, vec_E<Vehicle>>> surround_forward_trajs_;
+  /// 周围车辆多模态预测轨迹（全局坐标），仅用于 risk grid
+  MultiModalSurroundingTrajectories multimodal_surround_trajs_;
 
   /// 障碍物栅格的 Frenet 坐标
   vec_E<Vec2f> obstacle_grids_fs_;
@@ -306,6 +308,8 @@ class SscPlanner : public Planner {
   std::unordered_map<int, vec_E<common::FsVehicle>> sur_vehicle_trajs_fs_;
   /// 周围车辆当前确定性预测轨迹的存在概率（key=车辆ID, value=argmax行为概率）
   std::unordered_map<int, decimal_t> surround_traj_existence_probs_;
+  /// 周围车辆多模态预测轨迹（Frenet 坐标），仅用于 risk grid
+  MultiModalSurroundingFsTrajectories multimodal_surround_trajs_fs_;
   /// 各行为下的周围车辆 Frenet 轨迹集合
   vec_E<std::unordered_map<int, vec_E<common::FsVehicle>>>
       surround_forward_trajs_fs_;

@@ -275,6 +275,15 @@ ErrorType SscPlanner::RunOnce() {
     surround_traj_existence_probs_.clear();
   }
 
+  // 1k. MVP-3: 获取周车多模态预测轨迹，仅用于 risk grid。
+  //     失败时清空该旁路，后续 risk grid 回退到 MVP-2 单轨迹概率填图。
+  if (map_itf_->GetMultiModalSurroundingTrajectories(
+          &multimodal_surround_trajs_) != kSuccess) {
+    LOG(WARNING) << "[Ssc]fail to get multimodal surrounding trajectories, "
+                 << "fallback risk grid to deterministic trajectories.";
+    multimodal_surround_trajs_.clear();
+  }
+
   auto t_prepare = timer_prepare.toc();
   LOG(WARNING) << "[Ssc]prepare time cost: " << t_prepare << " ms";
 
@@ -310,7 +319,8 @@ ErrorType SscPlanner::RunOnce() {
       // 将当前行为下的周围车辆轨迹和静态障碍物栅格写入 3D 栅格
       if (p_ssc_map_->ConstructSscMap(surround_forward_trajs_fs_[i],
                                       obstacle_grids_fs_,
-                                      surround_traj_existence_probs_)) {
+                                      surround_traj_existence_probs_,
+                                      multimodal_surround_trajs_fs_)) {
         LOG(ERROR) << "[Ssc]fail to construct ssc map.";
         return kWrongStatus;
       }
@@ -774,7 +784,26 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * 4. 静态障碍物栅格坐标
+  // * 4. 周围车辆多模态预测轨迹的所有状态 + 顶点
+  //    该旁路只用于 risk grid，不替换 deterministic surround_forward_trajs_。
+  {
+    for (const auto& vehicle_modes : multimodal_surround_trajs_) {
+      for (const auto& mode : vehicle_modes.second) {
+        for (int k = 0; k < static_cast<int>(mode.traj.size()); ++k) {
+          State traj_state = mode.traj[k].state();
+          global_state_vec.push_back(traj_state);
+
+          vec_E<Vec2f> v_vec;
+          common::SemanticsUtils::GetVehicleVertices(mode.traj[k].param(),
+                                                     traj_state, &v_vec);
+          global_point_vec.insert(global_point_vec.end(), v_vec.begin(),
+                                  v_vec.end());
+        }
+      }
+    }
+  }
+
+  // * 5. 静态障碍物栅格坐标
   {
     for (auto it = obstacle_grids_.begin(); it != obstacle_grids_.end(); ++it) {
       Vec2f pt((*it)[0], (*it)[1]);
@@ -865,7 +894,35 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * 恢复 4: 障碍物栅格的 Frenet 坐标
+  // * 恢复 4: 周围车辆多模态预测轨迹 (Frenet 坐标)
+  {
+    multimodal_surround_trajs_fs_.clear();
+    for (const auto& vehicle_modes : multimodal_surround_trajs_) {
+      const int vehicle_id = vehicle_modes.first;
+      vec_E<SurroundingVehicleFsTrajectoryMode> fs_modes;
+      for (const auto& mode : vehicle_modes.second) {
+        SurroundingVehicleFsTrajectoryMode fs_mode;
+        fs_mode.vehicle_id = mode.vehicle_id;
+        fs_mode.lat_behavior = mode.lat_behavior;
+        fs_mode.probability = mode.probability;
+        for (int k = 0; k < static_cast<int>(mode.traj.size()); ++k) {
+          common::FsVehicle fs_v;
+          fs_v.frenet_state = frenet_state_vec[offset];
+          for (int i = 0; i < num_v; ++i) {
+            fs_v.vertices.push_back(fs_point_vec[offset * num_v + i]);
+          }
+          fs_mode.traj.emplace_back(fs_v);
+          offset++;
+        }
+        fs_modes.emplace_back(fs_mode);
+      }
+      if (!fs_modes.empty()) {
+        multimodal_surround_trajs_fs_.insert({vehicle_id, fs_modes});
+      }
+    }
+  }
+
+  // * 恢复 5: 障碍物栅格的 Frenet 坐标
   {
     obstacle_grids_fs_.clear();
     for (int i = 0; i < static_cast<int>(obstacle_grids_.size()); ++i) {
