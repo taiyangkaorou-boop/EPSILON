@@ -8,7 +8,8 @@
 负责启动 test_ssc_with_eudm 节点（EUDM行为规划器 + SSC运动规划器的集成入口）。
 
 [功能说明]
-1. 声明启动参数 (arena_info_static_topic, arena_info_dynamic_topic, ctrl_topic, playground)
+1. 声明启动参数 (arena_info_static_topic, arena_info_dynamic_topic, ctrl_topic,
+   playground, ssc_config_path)
 2. 通过 PathJoinSubstitution 动态拼接各模块配置文件路径
 3. 配置 remappings 将内部话题名映射到外部话题名
 
@@ -17,6 +18,8 @@
 - arena_info_dynamic_topic: 动态竞技场信息话题名 (车辆实时位置、速度等动态信息)
 - ctrl_topic: 发布自车控制指令的话题名 (vehicle_msgs::msg::ControlSignal)
 - playground: 运行场景名称 (如 highway_v1.0), 决定加载哪个场景的地图和车辆配置
+- ssc_config_path: SSC 配置文件路径，默认使用包内 baseline 配置；实验时可覆盖为
+  `ssc_config_risk_observe.pb.txt` 等风险消融配置
 
 [话题重映射]
 内部话题 -> 外部话题 (由启动参数配置):
@@ -51,6 +54,13 @@ def generate_launch_description():
     + 'agent_config.json'                                # 智能体配置文件名
     = 完整路径: .../share/playgrounds/highway_v1.0/agent_config.json
     """
+    # 默认 SSC 配置路径。MVP-11 允许通过 ssc_config_path 覆盖该路径，
+    # 便于同一 launch 入口复用 baseline / risk corridor / fallback 等消融配置。
+    default_ssc_config_path = PathJoinSubstitution([
+        get_package_share_directory('ssc_planner'),
+        'config',
+        'ssc_config.pb.txt'
+    ])
 
     # ---------- 声明启动参数 (DeclareLaunchArgument) ----------
     # 静态竞技场信息话题: 包含地图、车道拓扑等不随仿真时间变化的信息
@@ -68,6 +78,10 @@ def generate_launch_description():
     # 场景名称参数: 决定加载哪个 playground 中的地图和车辆配置
     playground = DeclareLaunchArgument(
         'playground', default_value='highway_v1.0'
+    )
+    # SSC 配置文件参数: 默认保持原配置，实验时可传入其他 pb.txt 配置文件
+    ssc_config_path = DeclareLaunchArgument(
+        'ssc_config_path', default_value=default_ssc_config_path
     )
 
     # ---------- 定义要启动的节点 ----------
@@ -93,11 +107,7 @@ def generate_launch_description():
                 'eudm_config.pb.txt'
             ]),
             # SSC 运动规划器配置文件路径: protobuf 格式, 定义轨迹优化参数
-            'ssc_config_path': PathJoinSubstitution([
-                get_package_share_directory('ssc_planner'),
-                'config',
-                'ssc_config.pb.txt'
-            ])
+            'ssc_config_path': LaunchConfiguration('ssc_config_path')
         }],
         # remappings: 将节点内部使用的话题名重新映射到外部话题名
         remappings=[
@@ -113,11 +123,13 @@ def generate_launch_description():
         arena_info_dynamic_topic,
         ctrl_topic,
         playground,
+        ssc_config_path,
         # 启动时打印关键参数, 便于确认配置是否正确的日志信息
         LogInfo(msg=['arena_info_static_topic: ', LaunchConfiguration('arena_info_static_topic')]),
         LogInfo(msg=['arena_info_dynamic_topic: ', LaunchConfiguration('arena_info_dynamic_topic')]),
         LogInfo(msg=['ctrl_topic: ', LaunchConfiguration('ctrl_topic')]),
         LogInfo(msg=['playground: ', LaunchConfiguration('playground')]),
+        LogInfo(msg=['ssc_config_path: ', LaunchConfiguration('ssc_config_path')]),
         LogInfo(msg="Launching node..."),
         test_ssc_with_eudm_node
     ])
