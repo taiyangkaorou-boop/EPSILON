@@ -137,7 +137,8 @@ ErrorType SscMap::GetInitialCubeUsingSeed(
 ErrorType SscMap::ConstructSscMap(
     const std::unordered_map<int, vec_E<common::FsVehicle>>
         &sur_vehicle_trajs_fs,
-    const vec_E<Vec2f> &obstacle_grids) {
+    const vec_E<Vec2f> &obstacle_grids,
+    const std::unordered_map<int, decimal_t> &traj_probs) {
   // 清空两张栅格地图
   p_3d_grid_->clear_data();
   p_3d_inflated_grid_->clear_data();
@@ -150,9 +151,8 @@ ErrorType SscMap::ConstructSscMap(
 
   /// @brief 第3步（新增）: 概率化填充动态障碍物到风险占据图
   /// @note 此步骤在原始 binary 填充之后执行，不影响二进制占据图。
-  ///       MVP-0 中 existence_prob = 1.0f，即确定性轨迹镜像。
-  ///       后续 MVP-1 将替换为来自 MOBIL/EUDM 的真实概率值
-  FillDynamicPartProbabilistic(sur_vehicle_trajs_fs);
+  ///       MVP-2 中 existence_prob 来自周车 argmax 横向行为概率。
+  FillDynamicPartProbabilistic(sur_vehicle_trajs_fs, traj_probs);
 
   /// @brief 第4步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
   /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
@@ -1231,12 +1231,20 @@ ErrorType SscMap::FillMapWithFsVehicleTraj(
 /// @note 此函数的结构与 FillDynamicPart 完全对称，区别在于调用
 ///       FillMapWithFsVehicleTrajProbabilistic 而非 FillMapWithFsVehicleTraj
 ErrorType SscMap::FillDynamicPartProbabilistic(
-    const std::unordered_map<int, vec_E<common::FsVehicle>>& sur_vehicle_trajs_fs) {
+    const std::unordered_map<int, vec_E<common::FsVehicle>>& sur_vehicle_trajs_fs,
+    const std::unordered_map<int, decimal_t> &traj_probs) {
   /// @brief 逐车填充风险占据图 —— 遍历 sur_vehicle_trajs_fs 中的每辆车
   /// @note 对每辆周围车辆的完整预测轨迹调用概率化填充，
-  ///       填充值为 MVP-0 固定的 existence_prob = 1.0f
+  ///       填充值优先使用 traj_probs[vehicle_id]，缺失时保守回退 1.0f。
   for (auto it = sur_vehicle_trajs_fs.begin(); it != sur_vehicle_trajs_fs.end(); ++it) {
-    FillMapWithFsVehicleTrajProbabilistic(it->second);
+    float existence_prob = 1.0f;
+    auto prob_it = traj_probs.find(it->first);
+    if (prob_it != traj_probs.end()) {
+      existence_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0, prob_it->second)));
+    }
+    FillMapWithFsVehicleTrajProbabilistic(it->second, existence_prob);
   }
   return kSuccess;
 }
@@ -1261,16 +1269,12 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
 ///       不做概率累加，不做 max 逻辑，不做时间衰减。
 ///       后续 MVP-1 将传入真实存在概率替代 1.0f
 ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
-    const vec_E<common::FsVehicle> traj) {
+    const vec_E<common::FsVehicle> traj, const float existence_prob) {
   /// @brief Step 1: 空轨迹检查 —— 轨迹为空时为无效输入
   if (traj.size() == 0) {
     LOG(ERROR) << "[Ssc] SscMap - Trajectory is empty (risk).";
     return kWrongStatus;
   }
-
-  /// @brief MVP-0 固定概率值 —— 确定性轨迹镜像，每条轨迹存在概率为 100%
-  /// @note 后续 MVP-1 将从 MOBIL 行为预测或 Bayesian 融合中获取真实概率
-  const float existence_prob = 1.0f;
 
   /// @brief Step 2: 逐帧遍历轨迹，将每帧车辆轮廓写入风险栅格
   for (int i = 0; i < static_cast<int>(traj.size()); ++i) {

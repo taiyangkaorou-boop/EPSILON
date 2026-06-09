@@ -127,6 +127,12 @@ class SscPlannerMapItf {
       std::vector<LateralBehavior>* behaviors,
       vec_E<vec_E<common::Vehicle>>* trajs,
       vec_E<std::unordered_map<int, vec_E<Vehicle>>>* sur_trajs) = 0;
+
+  /// @brief 获取周围车辆当前确定性预测轨迹的存在概率
+  /// @param traj_probs 输出: key=车辆ID, value=该车当前 argmax 横向行为概率
+  /// @note MVP-2 只把已有单条确定性周车轨迹按概率加权，不生成多模态轨迹。
+  virtual ErrorType GetSurroundingTrajectoryExistenceProbabilities(
+      std::unordered_map<int, decimal_t>* traj_probs) = 0;
 };
 
 }  // namespace planning

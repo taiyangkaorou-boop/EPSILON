@@ -266,6 +266,15 @@ ErrorType SscPlanner::RunOnce() {
     return kWrongStatus;
   }
 
+  // 1j. MVP-2: 获取周车当前确定性预测轨迹的存在概率。
+  //     该概率只写入并行 risk grid，不改变 binary SSC map/corridor/QP。
+  if (map_itf_->GetSurroundingTrajectoryExistenceProbabilities(
+          &surround_traj_existence_probs_) != kSuccess) {
+    LOG(WARNING) << "[Ssc]fail to get surrounding trajectory probabilities, "
+                 << "fallback risk existence probability to 1.0.";
+    surround_traj_existence_probs_.clear();
+  }
+
   auto t_prepare = timer_prepare.toc();
   LOG(WARNING) << "[Ssc]prepare time cost: " << t_prepare << " ms";
 
@@ -300,7 +309,8 @@ ErrorType SscPlanner::RunOnce() {
     if (!cfg_.planner_cfg().is_fitting_only()) {
       // 将当前行为下的周围车辆轨迹和静态障碍物栅格写入 3D 栅格
       if (p_ssc_map_->ConstructSscMap(surround_forward_trajs_fs_[i],
-                                      obstacle_grids_fs_)) {
+                                      obstacle_grids_fs_,
+                                      surround_traj_existence_probs_)) {
         LOG(ERROR) << "[Ssc]fail to construct ssc map.";
         return kWrongStatus;
       }

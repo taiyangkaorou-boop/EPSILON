@@ -27,6 +27,8 @@
  */
 #include "ssc_planner/map_adapter.h"
 
+#include <algorithm>
+
 namespace planning {
 
 /// @brief 设置/更新底层地图数据
@@ -97,6 +99,37 @@ ErrorType SscPlannerAdapter::GetForwardTrajectories(
   *behaviors = map_->ego_behavior().forward_behaviors;
   *trajs = map_->ego_behavior().forward_trajs;
   *sur_trajs = map_->ego_behavior().surround_trajs;
+  return kSuccess;
+}
+
+/// @brief 获取周围车辆当前确定性预测轨迹的存在概率
+///
+/// MVP-2 暂不生成 LK/LCL/LCR 多模态周车轨迹，因此这里只读取
+/// SemanticVehicle 中已经存在的 argmax 横向行为概率，用作当前单条
+/// 周车预测轨迹写入 risk grid 的权重。
+ErrorType SscPlannerAdapter::GetSurroundingTrajectoryExistenceProbabilities(
+    std::unordered_map<int, decimal_t>* traj_probs) {
+  if (!is_valid_ || traj_probs == nullptr) return kWrongStatus;
+
+  traj_probs->clear();
+  const auto semantic_vehicle_set = map_->semantic_surrounding_vehicles();
+  for (const auto& entry : semantic_vehicle_set.semantic_vehicles) {
+    const int vehicle_id = entry.first;
+    const auto& semantic_vehicle = entry.second;
+    decimal_t existence_prob = 1.0;
+
+    const auto& probs = semantic_vehicle.probs_lat_behaviors;
+    if (probs.is_valid &&
+        semantic_vehicle.lat_behavior != common::LateralBehavior::kUndefined) {
+      const auto prob_it = probs.probs.find(semantic_vehicle.lat_behavior);
+      if (prob_it != probs.probs.end()) {
+        existence_prob = std::max<decimal_t>(
+            0.0, std::min<decimal_t>(1.0, prob_it->second));
+      }
+    }
+
+    traj_probs->insert({vehicle_id, existence_prob});
+  }
   return kSuccess;
 }
 

@@ -304,6 +304,8 @@ class SscPlanner : public Planner {
   vec_E<vec_E<common::FsVehicle>> forward_trajs_fs_;
   /// 周围车辆的 Frenet 轨迹（单组）
   std::unordered_map<int, vec_E<common::FsVehicle>> sur_vehicle_trajs_fs_;
+  /// 周围车辆当前确定性预测轨迹的存在概率（key=车辆ID, value=argmax行为概率）
+  std::unordered_map<int, decimal_t> surround_traj_existence_probs_;
   /// 各行为下的周围车辆 Frenet 轨迹集合
   vec_E<std::unordered_map<int, vec_E<common::FsVehicle>>>
       surround_forward_trajs_fs_;
