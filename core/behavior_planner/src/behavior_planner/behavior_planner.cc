@@ -101,8 +101,8 @@
  *     3. 分别记录自车轨迹和周围车辆轨迹
  *
  * IDM 跟驰模型:
- *   a = a_max * [1 - (v/v0)^delta - (s*/s)^2]
- *   其中 s* = s0 + v*T + v*Δv/(2*sqrt(a_max*b))
+ *   a = a_max * [1 - (v/v0)^delta - (s_star / s)^2]
+ *   其中 s_star = s0 + v*T + v*Δv/(2*sqrt(a_max*b))
  *
  * OpenloopSimForward（开环仿真，回退方案）:
  *   自车按 IDM 沿参考车道行驶，周围车辆各自独立沿各自车道行驶，
@@ -1116,12 +1116,12 @@ ErrorType BehaviorPlanner::GetDesiredVelocityOfTrajectory(
  *
  * ----- IDM 跟驰模型 -----
  *
- *   a = a_max * [1 - (v/v0)^delta - (s*/s)^2]
+ *   a = a_max * [1 - (v/v0)^delta - (s_star / s)^2]
  *   其中：
  *     v:     当前速度
  *     v0:    期望速度
  *     s:     实际跟车距离
- *     s*:    期望跟车距离 = s0 + v*T + v*Δv/(2*sqrt(a_max*b))
+ *     s_star: 期望跟车距离 = s0 + v*T + v*Δv/(2*sqrt(a_max*b))
  *     a_max: 最大加速度
  *     b:     舒适减速度
  *     delta: 加速指数

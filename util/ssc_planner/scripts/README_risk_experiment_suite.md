@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9 离线实验汇总脚本，用于把规划运行时导出的 CSV 转换为论文实验表格和趋势图。
+该目录提供 MVP-9/MVP-11 离线实验工具，用于把规划运行时导出的 CSV 转换为论文实验表格、趋势图和多实验消融矩阵。
 
 ## 2. 输入文件
 
@@ -22,7 +22,44 @@ MVP-7: adaptive risk weight 上下文字段
 MVP-8: safety fallback 上下文字段
 ```
 
-## 3. 运行方式
+## 3. 推荐实验配置
+
+MVP-11 新增三份可选 SSC 配置。默认 `ssc_config.pb.txt` 仍保持 baseline 行为，
+下面配置只在 launch 时显式传入，便于回滚和做消融对比。
+
+```text
+ssc_config.pb.txt                 -> Baseline SSC，风险功能默认关闭
+ssc_config_risk_observe.pb.txt    -> 只记录 risk grid / exposure，不改变最终候选
+ssc_config_risk_corridor.pb.txt   -> 开启 risk-aware corridor，不开启候选重选
+ssc_config_risk_full.pb.txt       -> 开启 corridor + risk exposure reselect + adaptive + fallback
+```
+
+规划节点可通过 `ssc_config_path` 覆盖配置，例如：
+
+```bash
+ros2 launch planning_integrated test_ssc_with_eudm_ros_launch.py \
+  playground:=highway_v1.0 \
+  ssc_config_path:=/home/ros/work/graduateworkcc/install/ssc_planner/share/ssc_planner/config/ssc_config_risk_observe.pb.txt
+```
+
+每次实验开始前建议清理旧 CSV，避免跨实验混写：
+
+```bash
+rm -f /tmp/epsilon_risk_grid_stats.csv /tmp/epsilon_mvp6_risk_exposure.csv
+```
+
+推荐每一组实验都按以下顺序执行：
+
+```text
+清理旧 CSV
+-> 运行一组指定配置
+-> 立即用 risk_experiment_report.py 导出该组 summary
+-> 再清理 CSV 并运行下一组
+```
+
+这样可以避免 observe / corridor / full 等不同实验组写入同一个 `/tmp` CSV 后互相污染。
+
+## 4. 单组实验汇总
 
 ```bash
 cd /home/ros/work/graduateworkcc/src/EPSILON
@@ -35,7 +72,29 @@ python3 util/ssc_planner/scripts/risk_experiment_report.py \
   --git-ref v0.9.0-mvp9-experiment-suite
 ```
 
-## 4. 输出文件
+## 5. 多组实验矩阵
+
+完成多组实验后，可用 `risk_experiment_matrix.py` 汇总多个 `summary.csv`：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_matrix.py \
+  --summary baseline=/tmp/epsilon_reports/baseline/summary.csv \
+  --summary observe=/tmp/epsilon_reports/risk_observe/summary.csv \
+  --summary corridor=/tmp/epsilon_reports/risk_corridor/summary.csv \
+  --summary full=/tmp/epsilon_reports/risk_full/summary.csv \
+  --output-dir /tmp/epsilon_reports/matrix
+```
+
+输出：
+
+```text
+matrix.csv
+matrix.json
+```
+
+`matrix.csv` 每行对应一个实验组，列为常用论文指标，适合直接导入表格或绘图脚本。
+
+## 6. 输出文件
 
 必定输出：
 
@@ -53,7 +112,7 @@ trajectory_exposure_max.png
 trajectory_risk_score.png
 ```
 
-## 5. 推荐消融实验分组
+## 7. 推荐消融实验分组
 
 ```text
 Baseline SSC
@@ -66,7 +125,7 @@ Adaptive risk weight
 Safety fallback
 ```
 
-## 6. 论文指标对应
+## 8. 论文指标对应
 
 ```text
 risk_grid.sum_risk              -> 风险图总体强度
@@ -94,7 +153,7 @@ safety_fallback_triggered_cycles -> 安全兜底触发的 planning cycle 数
 safety_fallback_switched_cycles -> 安全兜底触发并切换的 planning cycle 数
 ```
 
-## 7. 注意事项
+## 9. 注意事项
 
 脚本不参与 ROS 编译，不改变规划行为。它只读取 CSV 并写入离线报告文件，适合在每次实验运行后单独执行。
 

@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
   std::string bp_config_path = "";
   std::string ssc_config_path = "";
   double desired_vel = 6.0;
+  bool use_sim_state = true;
 
   // 声明 ROS2 参数 (参数名, 默认值), 可由 launch 文件覆盖
   node->declare_parameter<int>("ego_id", ego_id);
@@ -118,6 +119,8 @@ int main(int argc, char** argv) {
   node->declare_parameter<std::string>("agent_config_path", agent_config_path);
   node->declare_parameter<std::string>("bp_config_path", bp_config_path);
   node->declare_parameter<std::string>("ssc_config_path", ssc_config_path);
+  // 声明仿真状态参数，供 SscPlannerServer::Init() 后续读取。
+  node->declare_parameter<bool>("use_sim_state", use_sim_state);
 
   // 读取 ego_id: 自车在仿真器中的唯一标识符
   if (!node->get_parameter("ego_id", ego_id)) {
@@ -152,6 +155,14 @@ int main(int argc, char** argv) {
     RCLCPP_ERROR(node->get_logger(), "Failed to get parameter: ssc_config_path");
   } else {
     RCLCPP_INFO(node->get_logger(), "ssc_config_path: %s", ssc_config_path.c_str());
+  }
+
+  // 读取 use_sim_state: true 表示用仿真状态驱动执行轨迹采样。
+  if (!node->get_parameter("use_sim_state", use_sim_state)) {
+    RCLCPP_ERROR(node->get_logger(), "Failed to get parameter: use_sim_state");
+  } else {
+    RCLCPP_INFO(node->get_logger(), "use_sim_state: %s",
+                use_sim_state ? "true" : "false");
   }
 
   // ---------- 构建规划流水线 ----------
