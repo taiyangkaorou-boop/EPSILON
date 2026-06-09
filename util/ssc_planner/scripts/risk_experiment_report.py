@@ -14,10 +14,11 @@ import json
 import math
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Union
 
 
 Number = Optional[float]
+SummaryValue = Union[str, int, float, None]
 
 
 def parse_float(value: str) -> Number:
@@ -48,7 +49,7 @@ def read_csv(path: Path) -> List[Dict[str, str]]:
     """读取 CSV 文件；文件不存在时返回空列表，方便脚本用于部分实验数据。"""
     if not path.exists():
         return []
-    with path.open("r", newline="") as csv_file:
+    with path.open("r", newline="", encoding="utf-8") as csv_file:
         return list(csv.DictReader(csv_file))
 
 
@@ -62,7 +63,7 @@ def values(rows: Iterable[Dict[str, str]], field: str) -> List[float]:
     return result
 
 
-def summarize_numeric(rows: List[Dict[str, str]], field: str) -> Dict[str, Number]:
+def summarize_numeric(rows: List[Dict[str, str]], field: str) -> Dict[str, SummaryValue]:
     """计算单个数值字段的 count/mean/max/sum。"""
     field_values = values(rows, field)
     if not field_values:
@@ -80,9 +81,9 @@ def summarize_numeric(rows: List[Dict[str, str]], field: str) -> Dict[str, Numbe
     }
 
 
-def summarize_risk_grid(rows: List[Dict[str, str]]) -> Dict[str, Number]:
+def summarize_risk_grid(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
     """汇总 risk grid 统计 CSV。"""
-    summary: Dict[str, Number] = {"risk_grid_cycles": len(rows)}
+    summary: Dict[str, SummaryValue] = {"risk_grid_cycles": len(rows)}
     for field in [
         "nonzero_cells",
         "max_risk",
@@ -94,9 +95,9 @@ def summarize_risk_grid(rows: List[Dict[str, str]]) -> Dict[str, Number]:
     return summary
 
 
-def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, Number]:
+def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
     """汇总候选轨迹 risk exposure CSV。"""
-    summary: Dict[str, Number] = {"risk_exposure_rows": len(rows)}
+    summary: Dict[str, SummaryValue] = {"risk_exposure_rows": len(rows)}
     for field in [
         "exposure_sum",
         "exposure_mean",
@@ -110,12 +111,33 @@ def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, Number]:
     baseline_rows = [row for row in rows if parse_int(row.get("is_baseline", "")) == 1]
     summary["selected_rows"] = len(selected_rows)
     summary["baseline_rows"] = len(baseline_rows)
-    summary.update(
-        {
-            f"selected_{key}": value
-            for key, value in summarize_numeric(selected_rows, "exposure_max").items()
-        }
-    )
+    # selected/baseline 分开统计，便于论文中直接比较“最终轨迹”和“原始 SSC 候选”。
+    for prefix, subset_rows in [
+        ("selected", selected_rows),
+        ("baseline", baseline_rows),
+    ]:
+        for field in [
+            "exposure_sum",
+            "exposure_mean",
+            "exposure_max",
+            "high_risk_hits",
+            "risk_score",
+        ]:
+            summary.update(
+                {
+                    f"{prefix}_{key}": value
+                    for key, value in summarize_numeric(subset_rows, field).items()
+                }
+            )
+
+    adaptive_rows = [
+        row for row in rows if parse_int(row.get("adaptive_enabled", "")) == 1
+    ]
+    high_interaction_rows = [
+        row for row in rows if parse_int(row.get("high_interaction_risk", "")) == 1
+    ]
+    summary["adaptive_enabled_rows"] = len(adaptive_rows)
+    summary["high_interaction_risk_rows"] = len(high_interaction_rows)
 
     fallback_rows = [
         row for row in rows if parse_int(row.get("safety_fallback_triggered", "")) == 1
@@ -128,10 +150,10 @@ def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, Number]:
     return summary
 
 
-def write_summary_csv(summary: Dict[str, Number], output_path: Path) -> None:
+def write_summary_csv(summary: Dict[str, SummaryValue], output_path: Path) -> None:
     """将 summary 写成两列表格，便于论文表格或电子表格读取。"""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as csv_file:
+    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(["metric", "value"])
         for key in sorted(summary):
@@ -162,22 +184,37 @@ def plot_series(rows: List[Dict[str, str]], field: str, output_path: Path) -> No
 def build_argument_parser() -> argparse.ArgumentParser:
     """构造命令行参数解析器。"""
     parser = argparse.ArgumentParser(
-        description="Generate EPSILON risk-aware SSC offline experiment reports."
+        description="生成 EPSILON risk-aware SSC 离线实验汇总报告。"
     )
     parser.add_argument(
         "--risk-grid-csv",
         default="/tmp/epsilon_risk_grid_stats.csv",
-        help="MVP-1B risk grid statistics CSV path.",
+        help="MVP-1B risk grid 统计 CSV 路径。",
     )
     parser.add_argument(
         "--risk-exposure-csv",
         default="/tmp/epsilon_mvp6_risk_exposure.csv",
-        help="MVP-6/7/8 risk exposure CSV path.",
+        help="MVP-6/7/8 候选轨迹 risk exposure CSV 路径。",
     )
     parser.add_argument(
         "--output-dir",
         default="/tmp/epsilon_risk_experiment_report",
-        help="Directory for summary CSV/JSON and optional plots.",
+        help="summary CSV/JSON 和可选趋势图输出目录。",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default="",
+        help="实验组名称，例如 baseline_ssc 或 safety_fallback。",
+    )
+    parser.add_argument(
+        "--scenario-name",
+        default="",
+        help="场景名称，例如 cut_in、follow 或 merge。",
+    )
+    parser.add_argument(
+        "--git-ref",
+        default="",
+        help="实验对应的 commit 或 tag，用于论文数据追溯。",
     )
     return parser
 
@@ -189,13 +226,19 @@ def main() -> int:
     risk_grid_rows = read_csv(Path(args.risk_grid_csv))
     risk_exposure_rows = read_csv(Path(args.risk_exposure_csv))
 
-    summary: Dict[str, Number] = {}
+    summary: Dict[str, SummaryValue] = {
+        "experiment_name": args.experiment_name,
+        "scenario_name": args.scenario_name,
+        "git_ref": args.git_ref,
+        "risk_grid_csv": str(Path(args.risk_grid_csv)),
+        "risk_exposure_csv": str(Path(args.risk_exposure_csv)),
+    }
     summary.update(summarize_risk_grid(risk_grid_rows))
     summary.update(summarize_exposure(risk_exposure_rows))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_summary_csv(summary, output_dir / "summary.csv")
-    with (output_dir / "summary.json").open("w") as json_file:
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as json_file:
         json.dump(summary, json_file, indent=2, sort_keys=True)
 
     plot_series(risk_grid_rows, "sum_risk", output_dir / "risk_grid_sum.png")

@@ -29,7 +29,10 @@ cd /home/ros/work/graduateworkcc/src/EPSILON
 python3 util/ssc_planner/scripts/risk_experiment_report.py \
   --risk-grid-csv /tmp/epsilon_risk_grid_stats.csv \
   --risk-exposure-csv /tmp/epsilon_mvp6_risk_exposure.csv \
-  --output-dir /tmp/epsilon_risk_experiment_report
+  --output-dir /tmp/epsilon_risk_experiment_report \
+  --experiment-name safety_fallback \
+  --scenario-name cut_in \
+  --git-ref v0.9.0-mvp9-experiment-suite
 ```
 
 ## 4. 输出文件
@@ -72,9 +75,16 @@ risk_grid.active_time_layers    -> 风险在预测时间轴上的持续范围
 risk_exposure.exposure_max      -> 轨迹最大单点风险
 risk_exposure.exposure_sum      -> 轨迹风险暴露总量
 risk_exposure.high_risk_hits    -> 高风险采样点数量
+selected.*                      -> 最终选中轨迹的风险统计
+baseline.*                      -> 原始 SSC baseline 候选的风险统计
+adaptive_enabled_rows           -> 自适应风险权重参与评价的记录数
+high_interaction_risk_rows      -> 高交互风险场景记录数
 safety_fallback_switched_rows   -> 安全兜底触发并切换次数
 ```
 
 ## 7. 注意事项
 
 脚本不参与 ROS 编译，不改变规划行为。它只读取 CSV 并写入离线报告文件，适合在每次实验运行后单独执行。
+
+建议每组消融实验都显式填写 `--experiment-name`、`--scenario-name` 和 `--git-ref`，
+这样 `summary.csv` / `summary.json` 能直接追溯到实验配置和代码版本。
