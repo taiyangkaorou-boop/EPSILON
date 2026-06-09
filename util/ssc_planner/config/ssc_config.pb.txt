@@ -7,6 +7,19 @@ planner_cfg {
     low_speed_threshold: 2.0
     weight_proximity: 1.0
     is_fitting_only: false
+    # MVP-6: 默认只保留原始 SSC 轨迹选择，不计算/不重选风险暴露候选。
+    enable_risk_exposure_eval: false
+    enable_risk_exposure_reselect: false
+    # MVP-6: 权重为 0.0 时严格退化为 baseline 行为选择。
+    risk_exposure_weight: 0.0
+    # MVP-6: 只有风险软代价优势超过该裕度时，才允许替换 baseline 候选。
+    risk_exposure_switch_margin: 0.2
+    # MVP-6: 沿候选 Bezier 轨迹查询 risk grid 的时间步长。
+    risk_exposure_sample_dt: 0.2
+    # MVP-6: 高风险采样点计数阈值，用于日志/CSV 分析。
+    risk_exposure_high_threshold: 0.5
+    # MVP-6: 与 RiskGridStats CSV 分离，避免混淆地图统计和轨迹风险暴露。
+    risk_exposure_csv_path: "/tmp/epsilon_mvp6_risk_exposure.csv"
 }
 
 map_cfg {

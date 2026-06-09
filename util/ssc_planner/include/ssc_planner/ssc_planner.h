@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/basics/basics.h"
 #include "common/interface/planner.h"
@@ -203,6 +204,19 @@ class SscPlanner : public Planner {
   ErrorType RunOnce() override;
 
  private:
+  /// @brief MVP-6 候选轨迹风险暴露统计
+  /// @note 该结构只用于 QP 成功后的候选评价/日志/CSV。默认配置下不会影响轨迹选择。
+  struct RiskExposureMetrics {
+    int candidate_index = -1;                  ///< qp_trajs_ / valid_behaviors_ 中的候选索引
+    LateralBehavior behavior{LateralBehavior::kUndefined};  ///< 候选轨迹对应的横向行为
+    size_t sample_count = 0;                   ///< Bezier 轨迹采样点数量
+    size_t high_risk_hits = 0;                 ///< 风险值超过阈值的采样点数量
+    decimal_t exposure_sum = 0.0;              ///< 风险暴露总和 Σ Risk(s,d,t)
+    decimal_t exposure_mean = 0.0;             ///< 平均风险暴露
+    decimal_t exposure_max = 0.0;              ///< 最大单点风险
+    decimal_t risk_score = 0.0;                ///< 加权风险软代价 λ_risk * exposure_sum
+  };
+
   /// @brief 从 protobuf 文本文件读取配置
   ErrorType ReadConfig(const std::string config_path);
 
@@ -259,6 +273,41 @@ class SscPlanner : public Planner {
   ///   2. 若无精确匹配，回退到 LaneKeeping 行为
   /// @return 错误码，找不到匹配行为时失败
   ErrorType UpdateTrajectoryWithCurrentBehavior();
+
+  /// @brief 按原始 SSC 规则查找 baseline 候选轨迹索引
+  /// @return qp_trajs_ 中的候选索引；找不到精确行为且无 LaneKeeping 回退时返回 -1
+  /// @note MVP-6 将原有两级选择逻辑抽出，保证风险重选关闭时行为完全一致。
+  int FindBaselineTrajectoryIndex() const;
+
+  /// @brief 计算单条 QP 候选 Bezier 轨迹的风险暴露
+  /// @param candidate_index qp_trajs_ / valid_behaviors_ 中的候选索引
+  /// @return 风险暴露统计；若采样失败则 sample_count 为 0，风险默认为 0
+  /// @note MVP-6: 只读 p_ssc_map_ 的 risk grid，不修改 QP 轨迹、走廊或地图。
+  RiskExposureMetrics ComputeRiskExposureForCandidate(
+      const int candidate_index) const;
+
+  /// @brief 选择风险软代价最低的候选轨迹
+  /// @param baseline_index 原始 SSC 行为选择得到的候选索引
+  /// @param metrics 所有 QP 成功候选的风险暴露统计
+  /// @return 最终候选索引；默认返回 baseline_index
+  /// @note 只有 enable_risk_exposure_reselect=true 且风险优势超过切换裕度时才会改变选择。
+  int SelectRiskAwareTrajectoryIndex(
+      const int baseline_index,
+      const std::vector<RiskExposureMetrics>& metrics) const;
+
+  /// @brief 将 MVP-6 候选轨迹风险暴露结果追加写入 CSV
+  /// @param metrics 所有候选轨迹风险暴露统计
+  /// @param baseline_index 原始 SSC 选择的候选索引
+  /// @param selected_index MVP-6 最终选择的候选索引
+  /// @note CSV 仅用于论文实验分析；写入失败只打日志，不中断规划。
+  void AppendRiskExposureMetricsToCsv(
+      const std::vector<RiskExposureMetrics>& metrics,
+      const int baseline_index, const int selected_index) const;
+
+  /// @brief 判断 MVP-6 风险暴露评价是否需要启用
+  /// @return true 表示需要保存 risk grid 快照并计算候选轨迹 exposure
+  /// @note 评价开关或重选开关任一打开时都需要计算；默认二者关闭，不增加 baseline 开销。
+  bool IsRiskExposureEvaluationEnabled() const;
 
   // =========================================================================
   // 成员变量
@@ -324,6 +373,12 @@ class SscPlanner : public Planner {
   vec_E<vec_E<common::SpatioTemporalSemanticCubeNd<2>>> corridors_;
   /// 各行为的参考状态列表
   vec_E<vec_E<common::FrenetState>> ref_states_list_;
+  /// 每个前向行为对应的 risk grid 快照
+  /// @note ConstructSscMap() 按行为循环复用同一个 SscMap，当前地图只保留最后一次风险图；
+  ///       MVP-6 因此需要在每个行为构图后保存快照，避免候选 exposure 使用错位风险场。
+  std::vector<RiskGridMap3D> behavior_risk_grid_snapshots_;
+  /// 每个 QP 成功候选对应的 risk grid 快照，索引与 qp_trajs_ / valid_behaviors_ 对齐
+  std::vector<RiskGridMap3D> candidate_risk_grid_snapshots_;
 
   /// 是否横向独立（高速模式，横向与纵向解耦）
   bool is_lateral_independent_ = true;
@@ -354,6 +409,10 @@ class SscPlanner : public Planner {
 
   /// protobuf 配置对象，包含规划器和地图的所有参数
   planning::ssc::Config cfg_;
+  /// MVP-6 风险暴露 CSV 是否已经确认/写入 header
+  mutable bool risk_exposure_csv_header_written_ = false;
+  /// MVP-6 风险暴露 CSV 规划周期计数器
+  mutable size_t risk_exposure_cycle_count_ = 0;
 };
 
 }  // namespace planning
