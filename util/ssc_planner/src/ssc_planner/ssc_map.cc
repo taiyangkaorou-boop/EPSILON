@@ -1284,13 +1284,15 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
 ///          c. 范围检查: p_3d_grid_->CheckCoordInRange
 ///          d. 时间层计算: t_idx = coord[2]
 ///          e. 偏移量计算: layer_offset = t_idx * w * h
-///          f. OpenCV填充: cv::fillPoly 写入 CV_32FC1 浮点图层
+///          f. OpenCV填充: cv::fillPoly 先写入临时增量层，再累加到风险图
 ///       3. 越界/无效帧静默跳过，不影响其他帧
 ///
-/// @note MVP-0: existence_prob = 1.0f，将确定性轨迹镜像写入风险图。
-///       重叠区域会被后续 fillPoly 覆盖（最后写入者胜出），
-///       不做概率累加，不做 max 逻辑，不做时间衰减。
-///       后续 MVP-1 将传入真实存在概率替代 1.0f
+/// @note MVP-4: 将每条确定性/多模态轨迹视为一个占据概率源。先对该轨迹
+///       在每个时间层内的车辆轮廓取并集，再执行
+///       risk = min(1.0, risk + existence_prob)。这样同一栅格被多个周车或
+///       多个行为模态覆盖时会体现概率风险叠加，同时避免同一条轨迹在同一
+///       时间层内重复计数；原始 binary map 仍由 FillMapWithFsVehicleTraj
+///       独立维护，不受此函数影响。
 ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
     const vec_E<common::FsVehicle> traj, const float existence_prob) {
   /// @brief Step 1: 空轨迹检查 —— 轨迹为空时为无效输入
@@ -1299,11 +1301,26 @@ ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
     return kWrongStatus;
   }
 
-  /// @brief Step 2: 逐帧遍历轨迹，将每帧车辆轮廓写入风险栅格
+  /// @brief Step 2: 概率保护 —— 调用方通常已截断，这里再次保护底层写图语义
+  /// @note 负概率没有物理意义，超过 1.0 的概率按概率图上限截断。
+  const float clamped_existence_prob =
+      std::max(0.0f, std::min(1.0f, existence_prob));
+  if (clamped_existence_prob <= 0.0f) {
+    return kSuccess;
+  }
+
+  /// @brief Step 3: 初始化单条轨迹的分层占据 mask
+  /// @note key=t_idx，value=该轨迹在对应时间层内覆盖过的 s-d 栅格。
+  ///       使用 CV_8UC1 是为了先表达 0/1 占据并集，最后再乘以概率。
+  const int w = p_3d_grid_->dims_size()[0];  // s 方向栅格数（图像宽度）
+  const int h = p_3d_grid_->dims_size()[1];  // d 方向栅格数（图像高度）
+  std::unordered_map<int, cv::Mat> occupancy_mask_by_layer;
+
+  /// @brief Step 4: 逐帧遍历轨迹，将车辆轮廓写入该轨迹的占据 mask
   for (int i = 0; i < static_cast<int>(traj.size()); ++i) {
     bool is_valid = true;
 
-    /// @brief Step 2a: 验证所有轮廓顶点的 s 坐标 > 0
+    /// @brief Step 4a: 验证所有轮廓顶点的 s 坐标 > 0
     /// @note s <= 0 表示该点在自车后方或为无效数据，需跳过整帧
     for (const auto& v : traj[i].vertices) {
       if (v(0) <= 0) {
@@ -1313,7 +1330,7 @@ ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
     }
     if (!is_valid) continue;
 
-    /// @brief Step 2b: 将 Frenet 坐标 (s, d, t) 转换为 3D 栅格坐标 (ix, iy, it)
+    /// @brief Step 4b: 将 Frenet 坐标 (s, d, t) 转换为 3D 栅格坐标 (ix, iy, it)
     decimal_t z = traj[i].frenet_state.time_stamp;  // 当前帧的时间戳
     int t_idx = 0;
     std::vector<common::Point2i> v_coord;  // 该帧轮廓顶点的栅格坐标 (ix, iy)
@@ -1331,23 +1348,35 @@ ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
     }
     if (!is_valid) continue;
 
-    /// @brief Step 2c: 将栅格顶点转为 OpenCV Point2i 多边形格式
+    /// @brief Step 4c: 将栅格顶点转为 OpenCV Point2i 多边形格式
     std::vector<std::vector<cv::Point2i>> vv_coord_cv;
     std::vector<cv::Point2i> v_coord_cv;
     common::ShapeUtils::GetCvPoint2iVecUsingCommonPoint2iVec(v_coord, &v_coord_cv);
     vv_coord_cv.push_back(v_coord_cv);
 
-    /// @brief Step 2d: 计算该时间层在平铺一维数组中的偏移量
-    /// @note 布局: 按 t 分层，每层为 (d 行 × s 列) 的 row-major 矩阵
-    int w = p_3d_grid_->dims_size()[0];  // s 方向栅格数（图像宽度）
-    int h = p_3d_grid_->dims_size()[1];  // d 方向栅格数（图像高度）
-    int layer_offset = t_idx * w * h;    // 跳转到第 t_idx 时间层的起始地址
+    /// @brief Step 4d: 写入该轨迹在当前时间层的 0/1 占据并集
+    /// @note fillPoly 对 mask 是赋值写入；由于同一轨迹同一层只表示
+    ///       Occupancy_i=0/1，重复覆盖仍然保持为 1，不会重复累加概率。
+    auto mask_it = occupancy_mask_by_layer.find(t_idx);
+    if (mask_it == occupancy_mask_by_layer.end()) {
+      mask_it =
+          occupancy_mask_by_layer.emplace(t_idx, cv::Mat::zeros(h, w, CV_8UC1))
+              .first;
+    }
+    cv::fillPoly(mask_it->second, vv_coord_cv, cv::Scalar(1));
+  }
 
-    /// @brief Step 2e: 在风险占据图上执行多边形填充
-    /// @note CV_32FC1 = 单通道 32-bit 浮点数，值域 [0.0, 1.0]
-    ///       cv::Scalar(existence_prob) 将所有多边形内部像素设为存在概率
+  /// @brief Step 5: 将该轨迹各时间层的占据 mask 累加到全局风险图
+  /// @note 布局: 按 t 分层，每层为 (d 行 × s 列) 的 row-major 矩阵。
+  ///       delta_mat = Occupancy_i * existence_prob，随后执行截断式累加。
+  for (const auto& layer_mask : occupancy_mask_by_layer) {
+    const int t_idx = layer_mask.first;
+    const int layer_offset = t_idx * w * h;
     cv::Mat layer_mat(h, w, CV_32FC1, p_3d_risk_grid_.data() + layer_offset);
-    cv::fillPoly(layer_mat, vv_coord_cv, cv::Scalar(existence_prob));
+    cv::Mat delta_mat;
+    layer_mask.second.convertTo(delta_mat, CV_32FC1, clamped_existence_prob);
+    cv::add(layer_mat, delta_mat, layer_mat);
+    cv::threshold(layer_mat, layer_mat, 1.0, 1.0, cv::THRESH_TRUNC);
   }
 
   return kSuccess;

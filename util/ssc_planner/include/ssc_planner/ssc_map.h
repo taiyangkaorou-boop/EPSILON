@@ -393,8 +393,8 @@ class SscMap {
   /// @param existence_prob 该条确定性轨迹写入 risk grid 的存在概率
   /// @return kSuccess 填充成功 / kWrongStatus 轨迹为空
   /// @note 复用原始 FillMapWithFsVehicleTraj 的几何流程（坐标转换、范围检查、
-  ///       OpenCV fillPoly），但写入目标为 p_3d_risk_grid_（CV_32FC1），
-  ///       填充值为 existence_prob（MVP-2 来自行车 argmax 行为概率）
+  ///       OpenCV fillPoly）。MVP-4 起该函数不再覆盖已有风险值，而是将
+  ///       当前轨迹概率累加到 p_3d_risk_grid_，并把单元格风险截断到 1.0。
   ErrorType FillMapWithFsVehicleTrajProbabilistic(
       const vec_E<common::FsVehicle> traj, const float existence_prob);
 
