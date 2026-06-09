@@ -76,7 +76,11 @@ void SscVisualizer::VisualizeDataWithStamp(const rclcpp::Time &stamp,
   start_time_ = planner.time_origin();  // 记录时间原点用于计算相对时间
 
   VisualizeSscMap(stamp, planner.p_ssc_map());
-  VisualizeRiskGridInSscSpace(stamp, planner.p_ssc_map());
+  const RiskGridMap3D* selected_risk_grid =
+      planner.selected_risk_grid_snapshot();
+  VisualizeRiskGridInSscSpace(
+      stamp, planner.p_ssc_map(), selected_risk_grid,
+      selected_risk_grid != nullptr ? "selected_candidate" : "live_map");
   VisualizeEgoVehicleInSscSpace(stamp, planner.fs_ego_vehicle());
   VisualizeForwardTrajectoriesInSscSpace(stamp, planner.forward_trajs_fs(),
                                          planner.p_ssc_map());
@@ -177,14 +181,18 @@ void SscVisualizer::VisualizeSscMap(const rclcpp::Time &stamp,
 
 /// @brief 可视化概率风险栅格地图
 ///
-/// risk grid 当前是 SSC map 的并行调试侧通道，本函数只读 risk_grid()
-/// 并发布 RViz Marker，不回写二值占据图、不影响 corridor/QP/control。
+/// risk grid 当前是 SSC map 的并行调试侧通道，本函数只读 risk grid 或候选
+/// 快照并发布 RViz Marker，不回写二值占据图、不影响 corridor/QP/control。
 /// 坐标语义保持与 SSC map 一致：
 ///   - X = s 栅格中心
 ///   - Y = d 栅格中心
 ///   - Z = t - start_time_，仅用于时空调试图中的相对时间高度
 void SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp,
-                                                const SscMap *p_ssc_map) {
+                                                const SscMap *p_ssc_map,
+                                                const RiskGridMap3D
+                                                    *risk_grid_snapshot,
+                                                const std::string
+                                                    &source_label) {
   visualization_msgs::msg::MarkerArray risk_marker_arr;
   visualization_msgs::msg::Marker risk_marker;
   risk_marker.ns = "risk_grid";
@@ -203,9 +211,17 @@ void SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp,
   }
 
   const auto *p_grid = p_ssc_map->p_3d_grid();
-  const auto &risk_grid = p_ssc_map->risk_grid();
+  const RiskGridMap3D* risk_grid_to_visualize =
+      risk_grid_snapshot != nullptr ? risk_grid_snapshot : &p_ssc_map->risk_grid();
   const auto &dims_size = p_grid->dims_size();
   const auto &dims_resolution = p_grid->dims_resolution();
+  if (risk_grid_snapshot != nullptr &&
+      risk_grid_snapshot->size() != p_ssc_map->risk_grid().size()) {
+    RCLCPP_WARN(node_->get_logger(),
+                "[SscRiskGridVis] snapshot size mismatch, fallback to live map.");
+    risk_grid_to_visualize = &p_ssc_map->risk_grid();
+  }
+  const auto &risk_grid = *risk_grid_to_visualize;
 
   // MVP-1C 只做调试可视化：阈值取极小正数，确保 MVP-0/1A 中固定 1.0 的风险能显示。
   constexpr float kRiskGridVisualizationThreshold = 1.0e-6f;
@@ -267,6 +283,9 @@ void SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp,
     if (visualized_cells >= kMaxRiskGridVisualizationCells) break;
   }
 
+  RCLCPP_DEBUG(node_->get_logger(),
+               "[SscRiskGridVis] source=%s visualized_cells=%d",
+               source_label.c_str(), visualized_cells);
   risk_marker_arr.markers.push_back(risk_marker);
   const int num_markers = static_cast<int>(risk_marker_arr.markers.size());
   common::VisualizationUtil::FillHeaderIdInMarkerArray(
@@ -507,7 +526,7 @@ void SscVisualizer::VisualizeCorridorsInSscSpace(
 
   int num_markers = static_cast<int>(corridor_vec_marker.markers.size());
   common::VisualizationUtil::FillHeaderIdInMarkerArray(
-      node_->get_clock()->now(), std::string("ssc_map"), last_corridor_mk_cnt,
+      stamp, std::string("ssc_map"), last_corridor_mk_cnt,
       &corridor_vec_marker);
   corridor_pub_->publish(corridor_vec_marker);
   last_corridor_mk_cnt = num_markers;

@@ -51,6 +51,13 @@ class SscPlannerAdapter : public SscPlannerMapItf {
   /// @brief 获取地图时间戳
   decimal_t GetTimeStamp() override;
 
+  /// @brief 配置多模态周车预测时间参数
+  /// @param prediction_time 预测时长，单位 s
+  /// @param prediction_step 预测采样间隔，单位 s
+  /// @note 由 SscPlanner::Init() 根据 proto 配置和 SSC map 时间域传入。
+  void ConfigureMultiModalPrediction(const decimal_t prediction_time,
+                                     const decimal_t prediction_step) override;
+
   /// @brief 获取自车车辆信息
   ErrorType GetEgoVehicle(Vehicle* vehicle) override;
 
@@ -96,6 +103,14 @@ class SscPlannerAdapter : public SscPlannerMapItf {
   ErrorType GetMultiModalSurroundingTrajectories(
       MultiModalSurroundingTrajectories* multimodal_trajs) override;
 
+  /// @brief 获取按自车候选行为条件化的周围车辆多模态预测轨迹
+  /// @param multimodal_trajs_by_ego_behavior 输出 [ego_behavior_index][vehicle_id][mode]
+  /// @note 该接口会用 ego_behavior().surround_trajs[i] 覆盖对应候选下的
+  ///       周车 argmax 模态，使 LK/LCL/LCR 自车候选可以拥有不同风险场。
+  ErrorType GetBehaviorConditionedMultiModalSurroundingTrajectories(
+      BehaviorConditionedMultiModalSurroundingTrajectories*
+          multimodal_trajs_by_ego_behavior) override;
+
   /// @brief 获取障碍物占据栅格集合
   ErrorType GetObstacleGrids(
       std::set<std::array<decimal_t, 2>>* obs_grids) override;
@@ -110,6 +125,10 @@ class SscPlannerAdapter : public SscPlannerMapItf {
   std::shared_ptr<IntegratedMap> map_;
   /// 内部有效性标志
   bool is_valid_ = false;
+  /// 多模态预测时长，默认 5s；初始化后通常会被 SSC map horizon 覆盖
+  decimal_t multimodal_prediction_time_ = 5.0;
+  /// 多模态预测采样间隔，默认 0.2s
+  decimal_t multimodal_prediction_step_ = 0.2;
 };
 
 }  // namespace planning

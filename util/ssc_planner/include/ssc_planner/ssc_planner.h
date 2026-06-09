@@ -173,6 +173,21 @@ class SscPlanner : public Planner {
   /// @brief 获取最近一次规划的总耗时（毫秒）
   decimal_t time_cost() const { return time_cost_; }
 
+  /// @brief 获取最终选中候选对应的风险图快照
+  /// @return 指向候选 risk grid 快照的只读指针；无快照时返回 nullptr
+  /// @note 仅供 RViz/实验可视化读取，不参与规划决策。
+  const RiskGridMap3D* selected_risk_grid_snapshot() const;
+
+  /// @brief 获取原始 baseline 候选对应的风险图快照
+  /// @return 指向 baseline risk grid 快照的只读指针；无快照时返回 nullptr
+  const RiskGridMap3D* baseline_risk_grid_snapshot() const;
+
+  /// @brief 获取最终选中候选在 qp_trajs_ 中的索引
+  int selected_candidate_index() const { return selected_candidate_index_; }
+
+  /// @brief 获取原始 SSC baseline 候选在 qp_trajs_ 中的索引
+  int baseline_candidate_index() const { return baseline_candidate_index_; }
+
   /// @brief 获取初始 Frenet 状态
   common::FrenetState initial_frenet_state() const {
     return initial_frenet_state_;
@@ -244,6 +259,10 @@ class SscPlanner : public Planner {
 
   /// @brief 从 protobuf 文本文件读取配置
   ErrorType ReadConfig(const std::string config_path);
+
+  /// @brief 将 planner 配置中的多模态预测时间参数同步到地图接口
+  /// @note 该函数在 Init() 或 set_map_interface() 后均可调用；若地图接口尚未注入则延后。
+  void ConfigureMapInterfacePredictionHorizon();
 
   /// @brief 检查时空走廊的连续性
   /// 验证前后相邻立方体的时间上下界是否对齐（前一立方体 t_ub == 后一立方体 t_lb）
@@ -408,6 +427,10 @@ class SscPlanner : public Planner {
   vec_E<std::unordered_map<int, vec_E<Vehicle>>> surround_forward_trajs_;
   /// 周围车辆多模态预测轨迹（全局坐标），仅用于 risk grid
   MultiModalSurroundingTrajectories multimodal_surround_trajs_;
+  /// 按自车候选行为条件化的周围车辆多模态预测轨迹（全局坐标）
+  /// @note 第一维与 forward_behaviors_ 对齐；为空时回退到 multimodal_surround_trajs_。
+  BehaviorConditionedMultiModalSurroundingTrajectories
+      behavior_conditioned_multimodal_surround_trajs_;
 
   /// 障碍物栅格的 Frenet 坐标
   vec_E<Vec2f> obstacle_grids_fs_;
@@ -423,6 +446,10 @@ class SscPlanner : public Planner {
   std::unordered_map<int, decimal_t> surround_traj_existence_probs_;
   /// 周围车辆多模态预测轨迹（Frenet 坐标），仅用于 risk grid
   MultiModalSurroundingFsTrajectories multimodal_surround_trajs_fs_;
+  /// 按自车候选行为条件化的周围车辆多模态预测轨迹（Frenet 坐标）
+  /// @note 第一维与 forward_behaviors_ 对齐；RunOnce 构图时优先按行为索引读取。
+  vec_E<MultiModalSurroundingFsTrajectories>
+      behavior_conditioned_multimodal_surround_trajs_fs_;
   /// 各行为下的周围车辆 Frenet 轨迹集合
   vec_E<std::unordered_map<int, vec_E<common::FsVehicle>>>
       surround_forward_trajs_fs_;
@@ -443,6 +470,10 @@ class SscPlanner : public Planner {
   std::vector<RiskGridMap3D> behavior_risk_grid_snapshots_;
   /// 每个 QP 成功候选对应的 risk grid 快照，索引与 qp_trajs_ / valid_behaviors_ 对齐
   std::vector<RiskGridMap3D> candidate_risk_grid_snapshots_;
+  /// 原始 SSC baseline 候选索引，用于 CSV/RViz 对照
+  int baseline_candidate_index_ = -1;
+  /// 最终选中候选索引，用于 RViz 显示与实验追踪
+  int selected_candidate_index_ = -1;
 
   /// 是否横向独立（高速模式，横向与纵向解耦）
   bool is_lateral_independent_ = true;
@@ -460,11 +491,11 @@ class SscPlanner : public Planner {
 
   // --- 地图相关 ---
   /// 地图接口指针（解耦对语义地图管理器的直接依赖）
-  SscPlannerMapItf* map_itf_;
+  SscPlannerMapItf* map_itf_ = nullptr;
   /// 地图接口是否有效
   bool map_valid_ = false;
   /// SSC 三维时空地图指针
-  SscMap* p_ssc_map_;
+  SscMap* p_ssc_map_ = nullptr;
 
   /// 当前规划帧的时间戳
   decimal_t stamp_ = 0.0;

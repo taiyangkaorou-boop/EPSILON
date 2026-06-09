@@ -149,6 +149,7 @@ class SscPlannerServer {
   std::unique_ptr<FrenetTrajectory> next_traj_;       ///< 下一帧将执行的轨迹（双缓冲）
 
   SscPlanner planner_;                         ///< SSC 规划器核心
+  bool planner_initialized_ = false;           ///< planner_.Init() 是否成功
   SscPlannerAdapter map_adapter_;              ///< 地图适配器（接口层）
 
   TicToc time_profile_tool_;                   ///< 耗时统计工具

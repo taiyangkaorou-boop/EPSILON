@@ -92,6 +92,7 @@
 #include "ssc_planner/ssc_planner.h"
 
 #include <algorithm>
+#include <unistd.h>
 #include <fstream>
 #include <glog/logging.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
@@ -108,6 +109,32 @@ namespace planning {
 /// @brief 返回规划器名称标识
 std::string SscPlanner::Name() { return std::string("ssc_planner"); }
 
+/// @brief 获取最终选中候选对应的 risk grid 快照
+const RiskGridMap3D* SscPlanner::selected_risk_grid_snapshot() const {
+  if (selected_candidate_index_ < 0 ||
+      selected_candidate_index_ >=
+          static_cast<int>(candidate_risk_grid_snapshots_.size()) ||
+      selected_candidate_index_ >= static_cast<int>(qp_trajs_.size()) ||
+      selected_candidate_index_ >= static_cast<int>(valid_behaviors_.size())) {
+    return nullptr;
+  }
+  return &candidate_risk_grid_snapshots_[static_cast<size_t>(
+      selected_candidate_index_)];
+}
+
+/// @brief 获取原始 baseline 候选对应的 risk grid 快照
+const RiskGridMap3D* SscPlanner::baseline_risk_grid_snapshot() const {
+  if (baseline_candidate_index_ < 0 ||
+      baseline_candidate_index_ >=
+          static_cast<int>(candidate_risk_grid_snapshots_.size()) ||
+      baseline_candidate_index_ >= static_cast<int>(qp_trajs_.size()) ||
+      baseline_candidate_index_ >= static_cast<int>(valid_behaviors_.size())) {
+    return nullptr;
+  }
+  return &candidate_risk_grid_snapshots_[static_cast<size_t>(
+      baseline_candidate_index_)];
+}
+
 /// @brief 初始化规划器
 ///
 /// 分两步：
@@ -117,7 +144,9 @@ std::string SscPlanner::Name() { return std::string("ssc_planner"); }
 /// @param config_path protobuf 文本格式配置文件路径
 ErrorType SscPlanner::Init(const std::string config_path) {
   // 第一步：读取 protobuf 配置
-  ReadConfig(config_path);
+  if (ReadConfig(config_path) != kSuccess) {
+    return kWrongStatus;
+  }
 
   // 打印规划器配置参数
   printf("\nSscPlanner Config:\n");
@@ -144,6 +173,10 @@ ErrorType SscPlanner::Init(const std::string config_path) {
             << cfg_.planner_cfg().risk_exposure_weight();
   LOG(INFO) << "[Ssc] -- enable_adaptive_risk_weight: "
             << cfg_.planner_cfg().enable_adaptive_risk_weight();
+  LOG(INFO) << "[Ssc] -- multimodal_prediction_time: "
+            << cfg_.planner_cfg().multimodal_prediction_time();
+  LOG(INFO) << "[Ssc] -- multimodal_prediction_step: "
+            << cfg_.planner_cfg().multimodal_prediction_step();
 
   // 第二步：构建 SscMap 配置并从 protobuf 映射参数
   SscMap::Config map_cfg;
@@ -188,6 +221,7 @@ ErrorType SscPlanner::Init(const std::string config_path) {
 
   // 创建 SSC 地图实例
   p_ssc_map_ = new SscMap(map_cfg);
+  ConfigureMapInterfacePredictionHorizon();
 
   return kSuccess;
 }
@@ -198,13 +232,46 @@ ErrorType SscPlanner::ReadConfig(const std::string config_path) {
   printf("\n[EudmPlanner] Loading ssc planner config\n");
   using namespace google::protobuf;
   int fd = open(config_path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    LOG(ERROR) << "[Ssc] failed to open config: " << config_path;
+    return kWrongStatus;
+  }
   io::FileInputStream fstream(fd);
-  TextFormat::Parse(&fstream, &cfg_);
+  const bool parse_ok = TextFormat::Parse(&fstream, &cfg_);
+  close(fd);
+  if (!parse_ok) {
+    LOG(ERROR) << "[Ssc] failed to parse config text from " << config_path;
+    return kWrongStatus;
+  }
   if (!cfg_.IsInitialized()) {
-    LOG(ERROR) << "failed to parse config from " << config_path;
-    assert(false);
+    LOG(ERROR) << "[Ssc] config is not fully initialized: " << config_path;
+    return kWrongStatus;
   }
   return kSuccess;
+}
+
+/// @brief 将多模态预测时间参数同步到地图接口
+/// @note 配置值 <=0 时从 SSC map 时间域推导，避免默认多模态预测 horizon 短于 risk grid。
+void SscPlanner::ConfigureMapInterfacePredictionHorizon() {
+  if (map_itf_ == nullptr || !cfg_.has_planner_cfg() || !cfg_.has_map_cfg()) {
+    return;
+  }
+
+  const decimal_t map_horizon =
+      std::max<decimal_t>(cfg_.map_cfg().map_resl_z(),
+                          cfg_.map_cfg().map_size_z() * cfg_.map_cfg().map_resl_z());
+  const decimal_t prediction_time =
+      cfg_.planner_cfg().multimodal_prediction_time() > 0.0
+          ? cfg_.planner_cfg().multimodal_prediction_time()
+          : map_horizon;
+  const decimal_t prediction_step =
+      cfg_.planner_cfg().multimodal_prediction_step() > 0.0
+          ? cfg_.planner_cfg().multimodal_prediction_step()
+          : cfg_.map_cfg().map_resl_z();
+
+  map_itf_->ConfigureMultiModalPrediction(prediction_time, prediction_step);
+  LOG(INFO) << "[Ssc] multimodal prediction configured time="
+            << prediction_time << " step=" << prediction_step;
 }
 
 /// @brief 设置规划起始状态（外部接口，用于闭环仿真）
@@ -221,6 +288,18 @@ ErrorType SscPlanner::set_initial_state(const State& state) {
 /// 总耗时通过 time_cost_ 记录，各子阶段之和与总耗时的差异 (diff) 反映
 /// 步骤间的调度开销。
 ErrorType SscPlanner::RunOnce() {
+  // 本帧开始前先清空候选 risk grid 状态，避免失败帧继续暴露上一帧快照。
+  behavior_risk_grid_snapshots_.clear();
+  candidate_risk_grid_snapshots_.clear();
+  baseline_candidate_index_ = -1;
+  selected_candidate_index_ = -1;
+
+  if (map_itf_ == nullptr || !map_valid_ || !map_itf_->IsValid() ||
+      p_ssc_map_ == nullptr) {
+    LOG(ERROR) << "[Ssc] RunOnce called before valid map interface or SSC map.";
+    return kWrongStatus;
+  }
+
   // 获取地图时间戳作为本帧标识
   stamp_ = map_itf_->GetTimeStamp();
   LOG(WARNING) << std::fixed << std::setprecision(4)
@@ -306,6 +385,17 @@ ErrorType SscPlanner::RunOnce() {
 
   // 1k. MVP-3: 获取周车多模态预测轨迹，仅用于 risk grid。
   //     失败时清空该旁路，后续 risk grid 回退到 MVP-2 单轨迹概率填图。
+  behavior_conditioned_multimodal_surround_trajs_.clear();
+  if (map_itf_->GetBehaviorConditionedMultiModalSurroundingTrajectories(
+          &behavior_conditioned_multimodal_surround_trajs_) == kSuccess) {
+    LOG(INFO) << "[Ssc]behavior-conditioned multimodal trajectories enabled, "
+              << "ego_behavior_count="
+              << behavior_conditioned_multimodal_surround_trajs_.size();
+  } else {
+    LOG(WARNING) << "[Ssc]fail to get behavior-conditioned multimodal "
+                 << "trajectories, fallback to global multimodal risk input.";
+    behavior_conditioned_multimodal_surround_trajs_.clear();
+  }
   if (map_itf_->GetMultiModalSurroundingTrajectories(
           &multimodal_surround_trajs_) != kSuccess) {
     LOG(WARNING) << "[Ssc]fail to get multimodal surrounding trajectories, "
@@ -342,32 +432,52 @@ ErrorType SscPlanner::RunOnce() {
 
   // 3b. 对每种行为: 构建地图并生成走廊
   int num_behaviors = forward_behaviors_.size();
-  const bool need_risk_exposure_metrics = ShouldComputeRiskExposureMetrics();
-  behavior_risk_grid_snapshots_.clear();
-  if (need_risk_exposure_metrics) {
-    behavior_risk_grid_snapshots_.reserve(static_cast<size_t>(num_behaviors));
+  if (forward_trajs_fs_.size() != forward_behaviors_.size() ||
+      surround_forward_trajs_fs_.size() != forward_behaviors_.size()) {
+    LOG(ERROR) << "[Ssc]transformed trajectory size mismatch, behaviors="
+               << static_cast<int>(forward_behaviors_.size())
+               << ", ego_forward_fs="
+               << static_cast<int>(forward_trajs_fs_.size())
+               << ", surround_forward_fs="
+               << static_cast<int>(surround_forward_trajs_fs_.size());
+    return kWrongStatus;
   }
+  // RViz 需要显示 selected/baseline 候选对应的 risk grid，而 SscMap 在每个
+  // behavior 构图时会复用并重置同一份地图，因此无论是否开启 risk exposure，
+  // 都保存每个 ego behavior 的风险图快照。
+  behavior_risk_grid_snapshots_.reserve(static_cast<size_t>(num_behaviors));
   for (int i = 0; i < num_behaviors; ++i) {
+    const MultiModalSurroundingFsTrajectories* multimodal_trajs_for_behavior =
+        &multimodal_surround_trajs_fs_;
+    if (i < static_cast<int>(
+                behavior_conditioned_multimodal_surround_trajs_fs_.size())) {
+      // MVP-10: 每个 ego candidate 优先使用自己对应的周车多模态风险场；
+      // 若该行为没有条件化结果，则回退到全局多模态旁路。
+      multimodal_trajs_for_behavior =
+          &behavior_conditioned_multimodal_surround_trajs_fs_[i];
+    }
+
     // 3b-i. 若非仅拟合模式 (is_fitting_only=false), 构建时空占据地图
     if (!cfg_.planner_cfg().is_fitting_only()) {
       // 将当前行为下的周围车辆轨迹和静态障碍物栅格写入 3D 栅格
       if (p_ssc_map_->ConstructSscMap(surround_forward_trajs_fs_[i],
                                       obstacle_grids_fs_,
                                       surround_traj_existence_probs_,
-                                      multimodal_surround_trajs_fs_)) {
+                                      *multimodal_trajs_for_behavior,
+                                      stamp_, i,
+                                      common::SemanticsUtils::RetLatBehaviorName(
+                                          forward_behaviors_[i]))) {
         LOG(ERROR) << "[Ssc]fail to construct ssc map.";
         return kWrongStatus;
       }
     }
 
-    // MVP-6: 每个行为的风险图在下一轮 ConstructSscMap 时会被清空重建，
-    // 因此必须在当前行为构图后立即保存快照，供后续 QP 候选 exposure 使用。
-    if (need_risk_exposure_metrics) {
-      if (cfg_.planner_cfg().is_fitting_only()) {
-        behavior_risk_grid_snapshots_.push_back(RiskGridMap3D());
-      } else {
-        behavior_risk_grid_snapshots_.push_back(p_ssc_map_->risk_grid());
-      }
+    // MVP-6/10: 每个行为的风险图在下一轮 ConstructSscMap 时会被清空重建，
+    // 因此必须在当前行为构图后立即保存快照，供候选 exposure 与 RViz 使用。
+    if (cfg_.planner_cfg().is_fitting_only()) {
+      behavior_risk_grid_snapshots_.push_back(RiskGridMap3D());
+    } else {
+      behavior_risk_grid_snapshots_.push_back(p_ssc_map_->risk_grid());
     }
 
     // 3b-ii. (可选) 障碍物膨胀 — EUDM 项目中为节省时间而省略
@@ -465,12 +575,17 @@ ErrorType SscPlanner::RunQpOptimization() {
 
   if (cube_list.empty()) return kWrongStatus;
 
-  // 一致性检查: 走廊数量必须等于行为数量
-  if (cube_list.size() != forward_behaviors_.size()) {
+  // 一致性检查: 走廊、行为、有效标志和前向轨迹必须同维，避免异常输入越界。
+  if (cube_list.size() != forward_behaviors_.size() ||
+      if_corridor_valid.size() != cube_list.size() ||
+      forward_trajs_fs_.size() != cube_list.size() ||
+      forward_trajs_.size() != cube_list.size()) {
     LOG(ERROR) << "[Ssc]cube list " << static_cast<int>(cube_list.size())
                << " not consist with behavior size: "
                << static_cast<int>(forward_behaviors_.size())
                << ", forward traj " << static_cast<int>(forward_trajs_.size())
+               << ", forward traj fs "
+               << static_cast<int>(forward_trajs_fs_.size())
                << ", flag size " << static_cast<int>(if_corridor_valid.size());
     return kWrongStatus;
   }
@@ -482,11 +597,11 @@ ErrorType SscPlanner::RunQpOptimization() {
   corridors_.clear();
   ref_states_list_.clear();
   candidate_risk_grid_snapshots_.clear();
+  baseline_candidate_index_ = -1;
+  selected_candidate_index_ = -1;
 
   // 遍历每种行为的走廊，逐一优化
   for (int i = 0; i < static_cast<int>(cube_list.size()); i++) {
-    int beh = static_cast<int>(forward_behaviors_[i]);
-
     // 跳过无效走廊
     if (if_corridor_valid[i] == 0) {
       LOG(ERROR) << "[Ssc]fail: for behavior "
@@ -497,6 +612,11 @@ ErrorType SscPlanner::RunQpOptimization() {
 
     auto fs_vehicle_traj = forward_trajs_fs_[i];
     int num_states = static_cast<int>(fs_vehicle_traj.size());
+    if (num_states < 1) {
+      LOG(ERROR) << "[Ssc]empty forward trajectory for behavior "
+                 << static_cast<int>(forward_behaviors_[i]);
+      continue;
+    }
 
     // ===================================================================
     // 步骤1: 构建起始约束 (3组 Vecf<2>)
@@ -591,14 +711,14 @@ ErrorType SscPlanner::RunQpOptimization() {
         }
         // 打印参考点序列
         LOG(ERROR) << "[Ssc]ref points: ";
-        for (int k = 0; k < ref_stamps.size(); ++k) {
+        for (size_t k = 0; k < ref_stamps.size(); ++k) {
           LOG(ERROR) << std::fixed << std::setprecision(4) << "[Ssc]" << k
                      << " t: " << ref_stamps[k] << ", x: " << ref_points[k].x()
                      << ", y: " << ref_points[k].y();
         }
         // 打印全局坐标下的前向轨迹
         LOG(ERROR) << "[Ssc]forward traj: ";
-        for (int k = 0; k < forward_trajs_[i].size(); ++k) {
+        for (size_t k = 0; k < forward_trajs_[i].size(); ++k) {
           auto v = forward_trajs_[i][k];
           LOG(ERROR) << std::fixed << std::setprecision(4) << "[Ssc]" << k
                      << " t: " << v.state().time_stamp
@@ -653,13 +773,11 @@ ErrorType SscPlanner::RunQpOptimization() {
     corridors_.push_back(cube_list[i]);
     ref_states_list_.push_back(ref_states);
     valid_behaviors_.push_back(forward_behaviors_[i]);
-    if (ShouldComputeRiskExposureMetrics()) {
-      if (i < static_cast<int>(behavior_risk_grid_snapshots_.size())) {
-        candidate_risk_grid_snapshots_.push_back(
-            behavior_risk_grid_snapshots_[static_cast<size_t>(i)]);
-      } else {
-        candidate_risk_grid_snapshots_.push_back(RiskGridMap3D());
-      }
+    if (i < static_cast<int>(behavior_risk_grid_snapshots_.size())) {
+      candidate_risk_grid_snapshots_.push_back(
+          behavior_risk_grid_snapshots_[static_cast<size_t>(i)]);
+    } else {
+      candidate_risk_grid_snapshots_.push_back(RiskGridMap3D());
     }
   }
 
@@ -690,6 +808,7 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
   if (baseline_index < 0) {
     return kWrongStatus;
   }
+  baseline_candidate_index_ = baseline_index;
 
   int index = baseline_index;
   std::vector<RiskExposureMetrics> risk_metrics;
@@ -726,6 +845,7 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
       FrenetPrimitiveTrajectory(primitive_trajs_[index], stf_);
   final_corridor_ = corridors_[index];
   final_ref_states_ = ref_states_list_[index];
+  selected_candidate_index_ = index;
 
   return kSuccess;
 }
@@ -758,11 +878,13 @@ int SscPlanner::FindBaselineTrajectoryIndex() const {
   return index;
 }
 
-/// @brief 计算单条 QP 候选轨迹的风险暴露
+/// @brief 计算单条候选执行轨迹的风险暴露
 /// @param candidate_index qp_trajs_ / valid_behaviors_ 中的候选索引
 /// @return 风险暴露统计
-/// @note MVP-6: 沿已求解成功的 Bezier 轨迹采样 (s,d,t)，从 risk grid 查询风险。
-///       这里不改变 Bezier 控制点，也不把风险写回 QP 目标或 corridor 约束。
+/// @note MVP-6: 沿候选最终执行轨迹采样 (s,d,t)，从 risk grid 查询风险。
+///       高速模式采样 Bezier 轨迹，低速模式采样 primitive 轨迹，避免风险重选
+///       和 safety fallback 评价的轨迹与实际输出轨迹不一致。这里不改变轨迹、
+///       不把风险写回 QP 目标或 corridor 约束。
 SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
     const int candidate_index, const decimal_t high_risk_threshold) const {
   RiskExposureMetrics metrics;
@@ -773,9 +895,19 @@ SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
   }
 
   metrics.behavior = valid_behaviors_[candidate_index];
-  const BezierSpline& candidate_traj = qp_trajs_[candidate_index];
-  const decimal_t begin_t = candidate_traj.begin();
-  const decimal_t end_t = candidate_traj.end();
+  const FrenetBezierTrajectory bezier_traj(qp_trajs_[candidate_index], stf_);
+  const FrenetPrimitiveTrajectory primitive_traj(primitive_trajs_[candidate_index],
+                                                stf_);
+  const common::FrenetTrajectory* candidate_traj =
+      is_lateral_independent_
+          ? static_cast<const common::FrenetTrajectory*>(&bezier_traj)
+          : static_cast<const common::FrenetTrajectory*>(&primitive_traj);
+  if (candidate_traj == nullptr || !candidate_traj->IsValid()) {
+    return metrics;
+  }
+
+  const decimal_t begin_t = candidate_traj->begin();
+  const decimal_t end_t = candidate_traj->end();
 
   // 采样步长做下限保护，避免配置为 0 或负数时进入死循环。
   const decimal_t sample_dt =
@@ -784,8 +916,8 @@ SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
 
   for (decimal_t t = begin_t; t <= end_t + kEPS; t += sample_dt) {
     const decimal_t query_t = std::min(t, end_t);
-    Vecf<2> pos;
-    if (candidate_traj.evaluate(query_t, 0, &pos) != kSuccess) {
+    common::FrenetState fs;
+    if (candidate_traj->GetFrenetState(query_t, &fs) != kSuccess) {
       continue;
     }
 
@@ -794,9 +926,10 @@ SscPlanner::RiskExposureMetrics SscPlanner::ComputeRiskExposureForCandidate(
         static_cast<int>(candidate_risk_grid_snapshots_.size())) {
       risk = p_ssc_map_->QueryRiskByMetricPositionInGrid(
           candidate_risk_grid_snapshots_[static_cast<size_t>(candidate_index)],
-          pos[0], pos[1], query_t);
+          fs.vec_s[0], fs.vec_dt[0], query_t);
     } else {
-      risk = p_ssc_map_->QueryRiskByMetricPosition(pos[0], pos[1], query_t);
+      risk = p_ssc_map_->QueryRiskByMetricPosition(fs.vec_s[0], fs.vec_dt[0],
+                                                   query_t);
     }
     metrics.exposure_sum += static_cast<decimal_t>(risk);
     metrics.exposure_max =
@@ -972,9 +1105,10 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
 }
 
 /// @brief 判断是否启用 MVP-6 候选轨迹风险暴露评价
-/// @return true 表示需要保存 risk grid 快照并计算 exposure
-/// @note 默认配置下 eval/reselect 都为 false，因此不保存快照、不采样、不写 CSV，
-///       轨迹选择直接退回原始 SSC baseline。MVP-7 自适应权重只在该评价链路中生效。
+/// @return true 表示需要计算 exposure 并写入评价链路
+/// @note risk grid 快照现在还服务 RViz selected-candidate 可视化，因此即使
+///       eval/reselect 关闭也会保存快照；默认关闭时仍不采样、不写 exposure CSV，
+///       轨迹选择直接退回原始 SSC baseline。
 bool SscPlanner::IsRiskExposureEvaluationEnabled() const {
   return cfg_.planner_cfg().enable_risk_exposure_eval() ||
          cfg_.planner_cfg().enable_risk_exposure_reselect();
@@ -1041,9 +1175,12 @@ SscPlanner::SafetyFallbackResult SscPlanner::ApplySafetyFallbackIfNeeded(
       selected_metric.exposure_max > max_risk_threshold;
   const bool trigger_by_sum =
       selected_metric.exposure_sum > exposure_sum_threshold;
+  // high_risk_hits_threshold == 0 表示关闭该触发条件，避免配置为 0 时
+  // 因 high_risk_hits >= 0 恒成立而让 safety fallback 每帧都触发。
   const bool trigger_by_hits =
+      high_risk_hits_threshold > 0 &&
       static_cast<int>(selected_metric.high_risk_hits) >=
-      high_risk_hits_threshold;
+          high_risk_hits_threshold;
   result.triggered = trigger_by_max_risk || trigger_by_sum || trigger_by_hits;
   if (!result.triggered) {
     return result;
@@ -1305,10 +1442,10 @@ ErrorType SscPlanner::StateTransformForInputData() {
   // * 3. 周围车辆预测轨迹的所有状态 + 顶点
   //    结构: surround_forward_trajs_[behavior_i][vehicle_id][frame_k]
   {
-    for (int i = 0; i < surround_forward_trajs_.size(); ++i) {
+    for (size_t i = 0; i < surround_forward_trajs_.size(); ++i) {
       for (auto it = surround_forward_trajs_[i].begin();
            it != surround_forward_trajs_[i].end(); ++it) {
-        for (int k = 0; k < it->second.size(); ++k) {
+        for (size_t k = 0; k < it->second.size(); ++k) {
           State traj_state = it->second[k].state();
           global_state_vec.push_back(traj_state);
 
@@ -1342,7 +1479,30 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * 5. 静态障碍物栅格坐标
+  // * 5. 按自车候选行为条件化的周车多模态预测轨迹
+  //    该结构为 [ego_behavior_index][vehicle_id][mode]，用于 MVP-10
+  //    为每个 ego candidate 构建独立的 risk grid。
+  {
+    for (const auto& multimodal_trajs_for_behavior :
+         behavior_conditioned_multimodal_surround_trajs_) {
+      for (const auto& vehicle_modes : multimodal_trajs_for_behavior) {
+        for (const auto& mode : vehicle_modes.second) {
+          for (int k = 0; k < static_cast<int>(mode.traj.size()); ++k) {
+            State traj_state = mode.traj[k].state();
+            global_state_vec.push_back(traj_state);
+
+            vec_E<Vec2f> v_vec;
+            common::SemanticsUtils::GetVehicleVertices(mode.traj[k].param(),
+                                                       traj_state, &v_vec);
+            global_point_vec.insert(global_point_vec.end(), v_vec.begin(),
+                                    v_vec.end());
+          }
+        }
+      }
+    }
+  }
+
+  // * 6. 静态障碍物栅格坐标
   {
     for (auto it = obstacle_grids_.begin(); it != obstacle_grids_.end(); ++it) {
       Vec2f pt((*it)[0], (*it)[1]);
@@ -1411,13 +1571,13 @@ ErrorType SscPlanner::StateTransformForInputData() {
   // * 恢复 3: 各行为下周围车辆预测轨迹 (Frenet 坐标)
   {
     surround_forward_trajs_fs_.clear();
-    for (int j = 0; j < surround_forward_trajs_.size(); ++j) {
+    for (size_t j = 0; j < surround_forward_trajs_.size(); ++j) {
       std::unordered_map<int, vec_E<common::FsVehicle>> sur_trajs;
       for (auto it = surround_forward_trajs_[j].begin();
            it != surround_forward_trajs_[j].end(); ++it) {
         int v_id = it->first;  // 车辆ID
         vec_E<common::FsVehicle> traj_fs;
-        for (int k = 0; k < it->second.size(); ++k) {
+        for (size_t k = 0; k < it->second.size(); ++k) {
           common::FsVehicle fs_v;
           fs_v.frenet_state = frenet_state_vec[offset];
           for (int i = 0; i < num_v; ++i) {
@@ -1461,7 +1621,43 @@ ErrorType SscPlanner::StateTransformForInputData() {
     }
   }
 
-  // * 恢复 5: 障碍物栅格的 Frenet 坐标
+  // * 恢复 5: 按自车候选行为条件化的周车多模态预测轨迹 (Frenet 坐标)
+  {
+    behavior_conditioned_multimodal_surround_trajs_fs_.clear();
+    behavior_conditioned_multimodal_surround_trajs_fs_.reserve(
+        behavior_conditioned_multimodal_surround_trajs_.size());
+    for (const auto& multimodal_trajs_for_behavior :
+         behavior_conditioned_multimodal_surround_trajs_) {
+      MultiModalSurroundingFsTrajectories fs_trajs_for_behavior;
+      for (const auto& vehicle_modes : multimodal_trajs_for_behavior) {
+        const int vehicle_id = vehicle_modes.first;
+        vec_E<SurroundingVehicleFsTrajectoryMode> fs_modes;
+        for (const auto& mode : vehicle_modes.second) {
+          SurroundingVehicleFsTrajectoryMode fs_mode;
+          fs_mode.vehicle_id = mode.vehicle_id;
+          fs_mode.lat_behavior = mode.lat_behavior;
+          fs_mode.probability = mode.probability;
+          for (int k = 0; k < static_cast<int>(mode.traj.size()); ++k) {
+            common::FsVehicle fs_v;
+            fs_v.frenet_state = frenet_state_vec[offset];
+            for (int i = 0; i < num_v; ++i) {
+              fs_v.vertices.push_back(fs_point_vec[offset * num_v + i]);
+            }
+            fs_mode.traj.emplace_back(fs_v);
+            offset++;
+          }
+          fs_modes.emplace_back(fs_mode);
+        }
+        if (!fs_modes.empty()) {
+          fs_trajs_for_behavior.insert({vehicle_id, fs_modes});
+        }
+      }
+      behavior_conditioned_multimodal_surround_trajs_fs_.emplace_back(
+          fs_trajs_for_behavior);
+    }
+  }
+
+  // * 恢复 6: 障碍物栅格的 Frenet 坐标
   {
     obstacle_grids_fs_.clear();
     for (int i = 0; i < static_cast<int>(obstacle_grids_.size()); ++i) {
@@ -1563,6 +1759,7 @@ ErrorType SscPlanner::set_map_interface(SscPlannerMapItf* map_itf) {
   if (map_itf == nullptr) return kIllegalInput;
   map_itf_ = map_itf;
   map_valid_ = true;
+  ConfigureMapInterfacePredictionHorizon();
   return kSuccess;
 }
 

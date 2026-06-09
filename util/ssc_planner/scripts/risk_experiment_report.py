@@ -14,11 +14,12 @@ import json
 import math
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 
 Number = Optional[float]
 SummaryValue = Union[str, int, float, None]
+RANGE_EPSILON = 1e-9  # 风险图行为差异判定阈值，用于过滤浮点格式误差。
 
 
 def parse_float(value: str) -> Number:
@@ -66,32 +67,256 @@ def values(rows: Iterable[Dict[str, str]], field: str) -> List[float]:
 def summarize_numeric(rows: List[Dict[str, str]], field: str) -> Dict[str, SummaryValue]:
     """计算单个数值字段的 count/mean/max/sum。"""
     field_values = values(rows, field)
+    return summarize_value_list(field, field_values)
+
+
+def summarize_value_list(metric_name: str, field_values: List[float]) -> Dict[str, SummaryValue]:
+    """计算一组数值的 count/mean/max/sum，metric_name 直接作为输出字段前缀。"""
     if not field_values:
         return {
-            f"{field}_count": 0,
-            f"{field}_mean": None,
-            f"{field}_max": None,
-            f"{field}_sum": None,
+            f"{metric_name}_count": 0,
+            f"{metric_name}_mean": None,
+            f"{metric_name}_max": None,
+            f"{metric_name}_sum": None,
         }
     return {
-        f"{field}_count": len(field_values),
-        f"{field}_mean": mean(field_values),
-        f"{field}_max": max(field_values),
-        f"{field}_sum": sum(field_values),
+        f"{metric_name}_count": len(field_values),
+        f"{metric_name}_mean": mean(field_values),
+        f"{metric_name}_max": max(field_values),
+        f"{metric_name}_sum": sum(field_values),
     }
+
+
+def group_rows_by_cycle(rows: List[Dict[str, str]]) -> Dict[Tuple[str, str], List[Dict[str, str]]]:
+    """按 (cycle, stamp) 聚合候选轨迹行，避免把候选行数误当规划周期数。"""
+    grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for row in rows:
+        cycle = row.get("cycle", "").strip()
+        stamp = row.get("stamp", "").strip()
+        if not cycle and not stamp:
+            continue
+        grouped.setdefault((cycle, stamp), []).append(row)
+    return grouped
+
+
+def risk_grid_planning_key(row: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    """提取 risk grid 行的 planning cycle key，优先使用同帧共享的 stamp。"""
+    stamp = row.get("stamp", "").strip()
+    if stamp:
+        return ("stamp", stamp)
+    cycle = row.get("cycle", "").strip()
+    if cycle:
+        return ("cycle", cycle)
+    return None
+
+
+def group_risk_grid_rows_by_planning_key(
+    rows: List[Dict[str, str]]
+) -> Dict[Tuple[str, str], List[Dict[str, str]]]:
+    """按 planning cycle 聚合 risk grid 行，用于比较同一帧不同 behavior 的风险图。"""
+    grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for row in rows:
+        key = risk_grid_planning_key(row)
+        if key is None:
+            continue
+        grouped.setdefault(key, []).append(row)
+    return grouped
+
+
+def risk_grid_behavior_id(row: Dict[str, str], row_index: int) -> str:
+    """提取 behavior 标识；旧 CSV 缺字段时退化为行号，避免误合并候选。"""
+    behavior_index = row.get("behavior_index", "").strip()
+    behavior_name = row.get("behavior", "").strip()
+    if behavior_index or behavior_name:
+        return f"{behavior_index}:{behavior_name}"
+    return f"row:{row_index}"
+
+
+def risk_grid_signature(row: Dict[str, str]) -> Tuple[SummaryValue, ...]:
+    """构造风险图统计签名，忽略 behavior 名称，只比较风险分布摘要是否不同。"""
+    signature_fields = [
+        "nonzero_cells",
+        "max_risk",
+        "sum_risk",
+        "active_time_layers",
+        "risk_source_vehicles",
+        "risk_source_modes",
+    ]
+    signature_values: List[SummaryValue] = []
+    for field in signature_fields:
+        parsed = parse_float(row.get(field, ""))
+        if parsed is None:
+            signature_values.append(row.get(field, "").strip())
+        else:
+            # 四舍五入只用于离线签名，避免 CSV 浮点格式尾差造成“伪差异”。
+            signature_values.append(round(parsed, 9))
+    return tuple(signature_values)
+
+
+def numeric_range(rows: List[Dict[str, str]], field: str) -> Optional[float]:
+    """计算某字段在同一 planning cycle 内的最大最小差。"""
+    field_values = values(rows, field)
+    if len(field_values) <= 1:
+        return None
+    return max(field_values) - min(field_values)
+
+
+def summarize_risk_grid_behavior_variation(
+    rows: List[Dict[str, str]]
+) -> Dict[str, SummaryValue]:
+    """统计同一 planning cycle 内不同 behavior 的 risk grid 差异度。"""
+    grouped_rows = group_risk_grid_rows_by_planning_key(rows)
+    summary: Dict[str, SummaryValue] = {
+        "risk_grid_behavior_groups": len(grouped_rows),
+        "risk_grid_behavior_multi_behavior_groups": 0,
+        "risk_grid_behavior_variant_groups": 0,
+        "risk_grid_behavior_unique_signature_groups": 0,
+    }
+    if not grouped_rows:
+        return summary
+
+    range_fields = [
+        "nonzero_cells",
+        "max_risk",
+        "sum_risk",
+        "active_time_layers",
+        "risk_source_vehicles",
+        "risk_source_modes",
+    ]
+    ranges_by_field: Dict[str, List[float]] = {field: [] for field in range_fields}
+
+    for rows_in_cycle in grouped_rows.values():
+        behavior_ids = {
+            risk_grid_behavior_id(row, row_index)
+            for row_index, row in enumerate(rows_in_cycle)
+        }
+        if len(behavior_ids) <= 1:
+            continue
+
+        summary["risk_grid_behavior_multi_behavior_groups"] = (
+            int(summary["risk_grid_behavior_multi_behavior_groups"]) + 1
+        )
+        signatures = {risk_grid_signature(row) for row in rows_in_cycle}
+        if len(signatures) > 1:
+            summary["risk_grid_behavior_unique_signature_groups"] = (
+                int(summary["risk_grid_behavior_unique_signature_groups"]) + 1
+            )
+
+        has_numeric_variation = False
+        for field in range_fields:
+            field_range = numeric_range(rows_in_cycle, field)
+            if field_range is None:
+                continue
+            ranges_by_field[field].append(field_range)
+            if field_range > RANGE_EPSILON:
+                has_numeric_variation = True
+        if has_numeric_variation:
+            summary["risk_grid_behavior_variant_groups"] = (
+                int(summary["risk_grid_behavior_variant_groups"]) + 1
+            )
+
+    multi_behavior_groups = int(summary["risk_grid_behavior_multi_behavior_groups"])
+    if multi_behavior_groups > 0:
+        summary["risk_grid_behavior_variant_ratio"] = (
+            int(summary["risk_grid_behavior_variant_groups"]) / multi_behavior_groups
+        )
+        summary["risk_grid_behavior_unique_signature_ratio"] = (
+            int(summary["risk_grid_behavior_unique_signature_groups"])
+            / multi_behavior_groups
+        )
+    else:
+        summary["risk_grid_behavior_variant_ratio"] = None
+        summary["risk_grid_behavior_unique_signature_ratio"] = None
+
+    for field, field_ranges in ranges_by_field.items():
+        summary.update(
+            summarize_value_list(f"risk_grid_behavior_{field}_range", field_ranges)
+        )
+    return summary
+
+
+def summarize_exposure_cycles(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
+    """按规划周期汇总 risk exposure，专门用于 fallback/adaptive 触发次数统计。"""
+    grouped_rows = group_rows_by_cycle(rows)
+    cycle_rows = list(grouped_rows.values())
+    summary: Dict[str, SummaryValue] = {"risk_exposure_cycles": len(cycle_rows)}
+    if not cycle_rows:
+        return summary
+
+    selected_rows: List[Dict[str, str]] = []
+    baseline_rows: List[Dict[str, str]] = []
+    fallback_triggered_cycles = 0
+    fallback_switched_cycles = 0
+    adaptive_enabled_cycles = 0
+    high_interaction_risk_cycles = 0
+
+    for rows_in_cycle in cycle_rows:
+        selected_row = next(
+            (row for row in rows_in_cycle if parse_int(row.get("is_selected", "")) == 1),
+            None,
+        )
+        baseline_row = next(
+            (row for row in rows_in_cycle if parse_int(row.get("is_baseline", "")) == 1),
+            None,
+        )
+        if selected_row is not None:
+            selected_rows.append(selected_row)
+        if baseline_row is not None:
+            baseline_rows.append(baseline_row)
+        if any(parse_int(row.get("safety_fallback_triggered", "")) == 1 for row in rows_in_cycle):
+            fallback_triggered_cycles += 1
+        if any(parse_int(row.get("safety_fallback_switched", "")) == 1 for row in rows_in_cycle):
+            fallback_switched_cycles += 1
+        if any(parse_int(row.get("adaptive_enabled", "")) == 1 for row in rows_in_cycle):
+            adaptive_enabled_cycles += 1
+        if any(parse_int(row.get("high_interaction_risk", "")) == 1 for row in rows_in_cycle):
+            high_interaction_risk_cycles += 1
+
+    summary["cycle_selected_rows"] = len(selected_rows)
+    summary["cycle_baseline_rows"] = len(baseline_rows)
+    summary["safety_fallback_triggered_cycles"] = fallback_triggered_cycles
+    summary["safety_fallback_switched_cycles"] = fallback_switched_cycles
+    summary["adaptive_enabled_cycles"] = adaptive_enabled_cycles
+    summary["high_interaction_risk_cycles"] = high_interaction_risk_cycles
+
+    # 周期级 selected/baseline 统计更适合论文表格，避免多候选行造成样本数膨胀。
+    for prefix, subset_rows in [
+        ("cycle_selected", selected_rows),
+        ("cycle_baseline", baseline_rows),
+    ]:
+        for field in [
+            "exposure_sum",
+            "exposure_mean",
+            "exposure_max",
+            "high_risk_hits",
+            "risk_score",
+        ]:
+            summary.update(
+                {
+                    f"{prefix}_{key}": value
+                    for key, value in summarize_numeric(subset_rows, field).items()
+                }
+            )
+    return summary
 
 
 def summarize_risk_grid(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
     """汇总 risk grid 统计 CSV。"""
-    summary: Dict[str, SummaryValue] = {"risk_grid_cycles": len(rows)}
+    summary: Dict[str, SummaryValue] = {
+        "risk_grid_rows": len(rows),
+        "risk_grid_map_builds": len(rows),
+    }
     for field in [
         "nonzero_cells",
         "max_risk",
         "sum_risk",
         "active_time_layers",
         "total_time_layers",
+        "risk_source_vehicles",
+        "risk_source_modes",
     ]:
         summary.update(summarize_numeric(rows, field))
+    summary.update(summarize_risk_grid_behavior_variation(rows))
     return summary
 
 
@@ -147,6 +372,7 @@ def summarize_exposure(rows: List[Dict[str, str]]) -> Dict[str, SummaryValue]:
     ]
     summary["safety_fallback_triggered_rows"] = len(fallback_rows)
     summary["safety_fallback_switched_rows"] = len(switched_rows)
+    summary.update(summarize_exposure_cycles(rows))
     return summary
 
 

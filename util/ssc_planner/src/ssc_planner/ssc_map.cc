@@ -139,7 +139,9 @@ ErrorType SscMap::ConstructSscMap(
         &sur_vehicle_trajs_fs,
     const vec_E<Vec2f> &obstacle_grids,
     const std::unordered_map<int, decimal_t> &traj_probs,
-    const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs) {
+    const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs,
+    const decimal_t stamp, const int behavior_index,
+    const std::string &behavior_name) {
   // 清空两张栅格地图
   p_3d_grid_->clear_data();
   p_3d_inflated_grid_->clear_data();
@@ -150,11 +152,17 @@ ErrorType SscMap::ConstructSscMap(
   // 第2步: 填充动态障碍物 (按时间层)
   FillDynamicPart(sur_vehicle_trajs_fs);
 
+  RiskGridSourceStats risk_source_stats = ComputeRiskGridSourceStats(
+      multimodal_trajs_fs, sur_vehicle_trajs_fs, traj_probs);
+
   /// @brief 第3步（新增）: 概率化填充动态障碍物到风险占据图
   /// @note 此步骤在原始 binary 填充之后执行，不影响二进制占据图。
-  ///       MVP-3 优先使用周车多模态轨迹；若没有多模态数据，则回退 MVP-2。
+  ///       MVP-3 优先使用周车多模态轨迹；若部分车辆未生成多模态轨迹，
+  ///       继续用 MVP-2 的 deterministic 轨迹概率补齐，避免 risk grid 因
+  ///       局部预测失败而漏掉周车风险。
   if (!multimodal_trajs_fs.empty()) {
-    FillDynamicPartProbabilistic(multimodal_trajs_fs);
+    FillDynamicPartProbabilistic(multimodal_trajs_fs, sur_vehicle_trajs_fs,
+                                 traj_probs);
   } else {
     FillDynamicPartProbabilistic(sur_vehicle_trajs_fs, traj_probs);
   }
@@ -169,11 +177,18 @@ ErrorType SscMap::ConstructSscMap(
                  << " high_risk_cells=" << high_risk_cells;
   }
 
-  /// @brief 第4步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
-  /// @note 仅读取 p_3d_risk_grid_，不修改任何地图数据，不影响规划决策
+  /// @brief 第5步（新增 MVP-1A）: 计算并输出 risk grid 统计日志
+  /// @note 统计函数本身仅读取 p_3d_risk_grid_，不修改任何地图数据；
+  ///       若上面的 risk-aware corridor 开关已开启，risk grid 已经通过
+  ///       阈值投影间接影响 corridor，本统计仅记录投影前的概率风险图。
   const auto risk_stats = ComputeRiskGridStats();
-  PrintRiskGridStatsIfNeeded(risk_stats);
-  AppendRiskGridStatsToCsv(risk_stats);
+  RiskGridStats risk_stats_with_sources = risk_stats;
+  risk_stats_with_sources.risk_source_vehicles =
+      risk_source_stats.vehicle_count;
+  risk_stats_with_sources.risk_source_modes = risk_source_stats.mode_count;
+  PrintRiskGridStatsIfNeeded(risk_stats_with_sources);
+  AppendRiskGridStatsToCsv(risk_stats_with_sources, stamp, behavior_index,
+                           behavior_name);
 
   return kSuccess;
 }
@@ -366,6 +381,71 @@ RiskGridStats SscMap::ComputeRiskGridStats() const {
   return stats;
 }
 
+/// @brief 统计本次 risk grid 填图实际使用的周车/模态数量
+/// @return RiskGridSourceStats，仅用于实验追踪，不参与风险值计算
+RiskGridSourceStats SscMap::ComputeRiskGridSourceStats(
+    const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs,
+    const std::unordered_map<int, vec_E<common::FsVehicle>>
+        &sur_vehicle_trajs_fs,
+    const std::unordered_map<int, decimal_t> &traj_probs) const {
+  RiskGridSourceStats stats;
+
+  std::unordered_map<int, decimal_t> generated_prob_mass_by_vehicle;
+  for (const auto& vehicle_modes : multimodal_trajs_fs) {
+    size_t valid_mode_count = 0;
+    decimal_t generated_prob_mass = 0.0;
+    for (const auto& mode : vehicle_modes.second) {
+      const decimal_t probability = std::max<decimal_t>(
+          0.0, std::min<decimal_t>(1.0, mode.probability));
+      if (probability <= 0.0 || mode.traj.empty()) {
+        continue;
+      }
+      ++valid_mode_count;
+      generated_prob_mass += probability;
+    }
+    if (valid_mode_count > 0) {
+      ++stats.vehicle_count;
+      stats.mode_count += valid_mode_count;
+      generated_prob_mass_by_vehicle[vehicle_modes.first] =
+          std::max<decimal_t>(0.0, std::min<decimal_t>(1.0,
+                                                       generated_prob_mass));
+    }
+  }
+
+  for (const auto& deterministic_traj : sur_vehicle_trajs_fs) {
+    if (deterministic_traj.second.empty()) {
+      continue;
+    }
+
+    float deterministic_prob = 1.0f;
+    const auto prob_it = traj_probs.find(deterministic_traj.first);
+    if (prob_it != traj_probs.end()) {
+      deterministic_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0, prob_it->second)));
+    }
+
+    const auto generated_it =
+        generated_prob_mass_by_vehicle.find(deterministic_traj.first);
+    if (generated_it != generated_prob_mass_by_vehicle.end()) {
+      deterministic_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(
+                       1.0, deterministic_prob - generated_it->second)));
+      if (deterministic_prob <= 0.0f) {
+        continue;
+      }
+      // 该车已有多模态风险源，只需把 deterministic 补齐轨迹计为额外模态。
+      ++stats.mode_count;
+    } else {
+      ++stats.vehicle_count;
+      ++stats.mode_count;
+    }
+  }
+
+  return stats;
+}
+
 /// @brief 按需输出风险占据栅格统计日志
 /// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
 /// @note MVP-1A: 使用 LOG(WARNING) 输出，前缀固定为 [Ssc][RiskGridStats]。
@@ -378,7 +458,9 @@ void SscMap::PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const {
                << " max_risk=" << stats.max_risk
                << " sum_risk=" << stats.sum_risk
                << " active_time_layers=" << stats.active_time_layers
-               << "/" << stats.nonzero_cells_per_layer.size();
+               << "/" << stats.nonzero_cells_per_layer.size()
+               << " risk_source_vehicles=" << stats.risk_source_vehicles
+               << " risk_source_modes=" << stats.risk_source_modes;
 
   /// @brief 逐层输出非零栅格数，用于验证 risk grid 是否被正确填充到各个时间层
   for (size_t layer = 0; layer < stats.nonzero_cells_per_layer.size(); ++layer) {
@@ -391,24 +473,49 @@ void SscMap::PrintRiskGridStatsIfNeeded(const RiskGridStats &stats) const {
 /// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
 /// @note MVP-1B: 只做实验数据记录，不修改 risk grid / binary map / corridor。
 ///       CSV 字段固定为:
-///       cycle,total_cells,nonzero_cells,max_risk,sum_risk,active_time_layers,total_time_layers
-void SscMap::AppendRiskGridStatsToCsv(const RiskGridStats &stats) const {
+///       map_build,stamp,behavior_index,behavior,total_cells,nonzero_cells,
+///       max_risk,sum_risk,active_time_layers,total_time_layers
+void SscMap::AppendRiskGridStatsToCsv(const RiskGridStats &stats,
+                                      const decimal_t stamp,
+                                      const int behavior_index,
+                                      const std::string &behavior_name) const {
   /// @brief 若 CSV 导出被关闭，立即返回，保持原始规划流程不受影响
   if (!risk_stats_csv_enabled_) {
     return;
   }
 
-  /// @brief 检查目标文件是否为空；空文件需要先写 header，已有数据则直接追加
+  const std::string expected_header =
+      "map_build,stamp,behavior_index,behavior,total_cells,nonzero_cells,"
+      "max_risk,sum_risk,active_time_layers,total_time_layers,"
+      "risk_source_vehicles,risk_source_modes";
+
+  /// @brief 检查目标文件是否为空；空文件需要先写 header，已有数据则直接追加。
+  ///        若历史 CSV 表头与当前 schema 不一致，则重写 /tmp 文件，避免列错位。
   bool csv_file_empty = true;
+  bool rewrite_csv_for_schema_mismatch = false;
   {
     std::ifstream existing_file(risk_stats_csv_path_);
     csv_file_empty =
         !existing_file.good() ||
         existing_file.peek() == std::ifstream::traits_type::eof();
+    if (!csv_file_empty) {
+      std::string existing_header;
+      std::getline(existing_file, existing_header);
+      if (existing_header != expected_header) {
+        rewrite_csv_for_schema_mismatch = true;
+        csv_file_empty = true;
+        LOG(WARNING) << "[Ssc][RiskGridStatsCsv] header schema changed, "
+                     << "rewrite " << risk_stats_csv_path_;
+      }
+    }
   }
 
-  /// @brief 以 append 模式打开 CSV，避免覆盖同一次实验中前面 planning cycle 的数据
-  std::ofstream csv_file(risk_stats_csv_path_, std::ofstream::out | std::ofstream::app);
+  /// @brief 以 append 模式打开 CSV；schema 不匹配时重写，避免新旧字段混表。
+  const auto open_mode =
+      rewrite_csv_for_schema_mismatch
+          ? (std::ofstream::out | std::ofstream::trunc)
+          : (std::ofstream::out | std::ofstream::app);
+  std::ofstream csv_file(risk_stats_csv_path_, open_mode);
   if (!csv_file.is_open()) {
     LOG(WARNING) << "[Ssc][RiskGridStatsCsv] failed to open "
                  << risk_stats_csv_path_;
@@ -417,23 +524,25 @@ void SscMap::AppendRiskGridStatsToCsv(const RiskGridStats &stats) const {
 
   /// @brief 文件为空时写入一次 header，便于后续 Python/pandas 直接读取
   if (csv_file_empty) {
-    csv_file << "cycle,total_cells,nonzero_cells,max_risk,sum_risk,"
-             << "active_time_layers,total_time_layers\n";
+    csv_file << expected_header << "\n";
     risk_stats_csv_header_written_ = true;
   } else if (!risk_stats_csv_header_written_) {
     /// @brief 文件已有 header 或历史数据时，仅同步进程内状态，避免重复写 header
     risk_stats_csv_header_written_ = true;
   }
 
-  /// @brief 记录当前 planning cycle 编号；该计数只服务 CSV 实验追踪，不参与规划
-  const size_t current_cycle = risk_stats_cycle_count_;
-  ++risk_stats_cycle_count_;
+  /// @brief 记录当前构图编号；同一 planning cycle 可能对应多个 behavior 构图
+  const size_t current_map_build = risk_stats_map_build_count_;
+  ++risk_stats_map_build_count_;
 
   /// @brief 追加一行统计数据，total_time_layers 直接来自 per-layer 统计数组长度
-  csv_file << current_cycle << "," << stats.total_cells << ","
+  csv_file << current_map_build << "," << stamp << "," << behavior_index
+           << "," << behavior_name << "," << stats.total_cells << ","
            << stats.nonzero_cells << "," << stats.max_risk << ","
            << stats.sum_risk << "," << stats.active_time_layers << ","
-           << stats.nonzero_cells_per_layer.size() << "\n";
+           << stats.nonzero_cells_per_layer.size() << ","
+           << stats.risk_source_vehicles << "," << stats.risk_source_modes
+           << "\n";
 
   /// @brief 写入失败只输出日志，不回滚地图或影响本次规划结果
   if (!csv_file.good()) {
@@ -522,6 +631,10 @@ ErrorType SscMap::ConstructCorridorUsingInitialTrajectory(
   // Stage II: 从种子对出发, 膨胀立方体构建走廊
   // ===================================================================
   common::DrivingCorridor driving_corridor;
+  // DrivingCorridor 在 common 中没有默认构造函数，局部创建后必须显式初始化
+  // 元数据，避免复制到 vector 时携带未定义 id/is_valid。
+  driving_corridor.id = static_cast<int>(driving_corridor_vec_.size());
+  driving_corridor.is_valid = true;
   bool is_valid = true;
   auto seed_num = static_cast<int>(traj_seeds.size());
 
@@ -1216,14 +1329,19 @@ ErrorType SscMap::GetFinalGlobalMetricCubesList() {
 ///
 /// 过滤: 跳过 s <= 0 的栅格 (可能为无效数据或自车后方)
 ErrorType SscMap::FillStaticPart(const vec_E<Vec2f> &obs_grid_fs) {
+  const auto map_origin = p_3d_grid_->origin();
   for (int i = 0; i < static_cast<int>(obs_grid_fs.size()); ++i) {
     if (obs_grid_fs[i](0) <= 0) {
       continue;  // 跳过无效的 s 坐标
     }
     // 在所有时间层上标记该 (s, d) 为占用
     for (int k = 0; k < config_.map_size[2]; ++k) {
+      // t 轴必须使用 SSC map 的绝对时间原点。直接使用 k*resolution 会在
+      // ROS 时间戳非零时映射到负时间层，导致静态障碍物完全漏填。
       std::array<decimal_t, 3> pt = {{obs_grid_fs[i](0), obs_grid_fs[i](1),
-                                      (double)k * config_.map_resolution[2]}};
+                                      map_origin[2] +
+                                          (double)k *
+                                              config_.map_resolution[2]}};
       auto coord = p_3d_grid_->GetCoordUsingGlobalPosition(pt);
       if (p_3d_grid_->CheckCoordInRange(coord)) {
         p_3d_grid_->SetValueUsingCoordinate(coord, 100);  // 100 = 占用标记
@@ -1364,6 +1482,60 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
   return kSuccess;
 }
 
+/// @brief 概率化填充多模态风险，并对缺失多模态的车辆做 deterministic 风险补齐
+/// @param multimodal_trajs_fs 周车多模态 Frenet 轨迹集合
+/// @param sur_vehicle_trajs_fs 原始 deterministic 周车 Frenet 轨迹集合
+/// @param traj_probs deterministic 周车轨迹概率表
+/// @return kSuccess
+/// @note 该函数修复“只要存在任意多模态轨迹，就跳过所有 deterministic 风险填图”
+///       的漏风险问题。多模态成功的车辆仍按 LK/LCL/LCR 概率叠加；未生成多模态
+///       的车辆继续使用已有 deterministic 轨迹和 argmax 行为概率写入风险图。
+ErrorType SscMap::FillDynamicPartProbabilistic(
+    const MultiModalSurroundingFsTrajectories& multimodal_trajs_fs,
+    const std::unordered_map<int, vec_E<common::FsVehicle>>& sur_vehicle_trajs_fs,
+    const std::unordered_map<int, decimal_t>& traj_probs) {
+  FillDynamicPartProbabilistic(multimodal_trajs_fs);
+
+  for (const auto& deterministic_traj : sur_vehicle_trajs_fs) {
+    const int vehicle_id = deterministic_traj.first;
+
+    float existence_prob = 1.0f;
+    const auto prob_it = traj_probs.find(vehicle_id);
+    if (prob_it != traj_probs.end()) {
+      existence_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0, prob_it->second)));
+    }
+
+    const auto multimodal_it = multimodal_trajs_fs.find(vehicle_id);
+    if (multimodal_it != multimodal_trajs_fs.end()) {
+      decimal_t generated_prob_mass = 0.0;
+      for (const auto& mode : multimodal_it->second) {
+        if (mode.traj.empty()) {
+          // 空轨迹不会写入 risk grid，因此不能消耗 deterministic 兜底概率。
+          continue;
+        }
+        generated_prob_mass += std::max<decimal_t>(
+            0.0, std::min<decimal_t>(1.0, mode.probability));
+      }
+      // 若某车只生成了部分低概率模态，则 deterministic 轨迹补齐剩余概率质量。
+      // 这样不会因为高概率模态车道构建失败而把该车风险从 risk grid 中吞掉。
+      existence_prob =
+          static_cast<float>(std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0,
+                                       existence_prob - generated_prob_mass)));
+      if (existence_prob <= 0.0f) {
+        continue;
+      }
+    }
+
+    FillMapWithFsVehicleTrajProbabilistic(deterministic_traj.second,
+                                          existence_prob);
+  }
+
+  return kSuccess;
+}
+
 /// @brief 概率化填充单条车辆 Frenet 轨迹到风险占据图
 /// @param traj 单辆周围车辆在 Frenet 坐标系下的完整预测轨迹 [frame_0, ... , frame_N]
 /// @return kSuccess 填充成功 / kWrongStatus 轨迹为空
@@ -1373,11 +1545,11 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
 ///       2. 逐帧遍历：对每个时间帧执行:
 ///          a. 顶点有效性验证: 所有轮廓顶点 s > 0
 ///          b. Frenet坐标 -> 栅格坐标: 通过 p_3d_grid_->GetCoordUsingGlobalPosition
-///          c. 范围检查: p_3d_grid_->CheckCoordInRange
+///          c. 范围检查: 时间层越界跳过；s/d 部分越界时裁剪到地图边界内
 ///          d. 时间层计算: t_idx = coord[2]
 ///          e. 偏移量计算: layer_offset = t_idx * w * h
 ///          f. OpenCV填充: cv::fillPoly 先写入临时增量层，再累加到风险图
-///       3. 越界/无效帧静默跳过，不影响其他帧
+///       3. 时间越界/完全无效帧静默跳过，不影响其他帧
 ///
 /// @note MVP-4: 将每条确定性/多模态轨迹视为一个占据概率源。先对该轨迹
 ///       在每个时间层内的车辆轮廓取并集，再执行
@@ -1385,6 +1557,8 @@ ErrorType SscMap::FillDynamicPartProbabilistic(
 ///       多个行为模态覆盖时会体现概率风险叠加，同时避免同一条轨迹在同一
 ///       时间层内重复计数；原始 binary map 仍由 FillMapWithFsVehicleTraj
 ///       独立维护，不受此函数影响。
+/// @note 风险图相比 binary map 更偏保守：车辆轮廓只有部分越过 s/d 边界时，
+///       不再丢弃整帧，而是把越界顶点夹到边界内，保留图内可见风险。
 ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
     const vec_E<common::FsVehicle> traj, const float existence_prob) {
   /// @brief Step 1: 空轨迹检查 —— 轨迹为空时为无效输入
@@ -1424,21 +1598,27 @@ ErrorType SscMap::FillMapWithFsVehicleTrajProbabilistic(
 
     /// @brief Step 4b: 将 Frenet 坐标 (s, d, t) 转换为 3D 栅格坐标 (ix, iy, it)
     decimal_t z = traj[i].frenet_state.time_stamp;  // 当前帧的时间戳
-    int t_idx = 0;
+    int t_idx = -1;
     std::vector<common::Point2i> v_coord;  // 该帧轮廓顶点的栅格坐标 (ix, iy)
     std::array<decimal_t, 3> p_w;          // 临时 Frenet 坐标容器 (s, d, t)
 
     for (const auto& v : traj[i].vertices) {
       p_w = {v(0), v(1), z};
       auto coord = p_3d_grid_->GetCoordUsingGlobalPosition(p_w);
-      t_idx = coord[2];  // 所有顶点应在同一时间层
-      if (!p_3d_grid_->CheckCoordInRange(coord)) {
+      // 时间层越界说明该帧不在 SSC risk grid 时间域内，直接跳过整帧。
+      if (coord[2] < 0 || coord[2] >= p_3d_grid_->dims_size()[2]) {
         is_valid = false;
         break;
       }
-      v_coord.push_back(common::Point2i(coord[0], coord[1]));
+      t_idx = coord[2];  // 所有顶点应在同一时间层
+
+      // s/d 方向部分越界时保守裁剪到边界内，避免车辆一半进入地图时整帧漏风险。
+      const int clipped_s = std::max(0, std::min(w - 1, coord[0]));
+      const int clipped_d = std::max(0, std::min(h - 1, coord[1]));
+      v_coord.push_back(common::Point2i(clipped_s, clipped_d));
     }
     if (!is_valid) continue;
+    if (t_idx < 0 || v_coord.size() < 3) continue;
 
     /// @brief Step 4c: 将栅格顶点转为 OpenCV Point2i 多边形格式
     std::vector<std::vector<cv::Point2i>> vv_coord_cv;

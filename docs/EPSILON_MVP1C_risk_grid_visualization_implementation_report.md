@@ -15,7 +15,7 @@
 
 新增函数：
 
-- `SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp, const SscMap *p_ssc_map)`
+- `SscVisualizer::VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp, const SscMap *p_ssc_map, const RiskGridMap3D *risk_grid_snapshot, const std::string &source_label)`
 
 新增成员：
 

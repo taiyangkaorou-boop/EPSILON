@@ -113,6 +113,14 @@ Visualization Manager:
         "": true
       Queue Size: 100
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Marker Topic: /vis/agent_0/ssc/risk_grid_vis
+      Name: RiskGrid
+      Namespaces:
+        risk_grid: true
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255

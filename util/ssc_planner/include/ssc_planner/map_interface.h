@@ -48,6 +48,13 @@ struct SurroundingVehicleTrajectoryMode {
 using MultiModalSurroundingTrajectories =
     std::unordered_map<int, vec_E<SurroundingVehicleTrajectoryMode>>;
 
+/// @brief 按自车候选行为分组的周围车辆多模态预测轨迹集合
+/// @note 第一维必须与 GetForwardTrajectories() 返回的 forward_behaviors 顺序一致：
+///       [ego_behavior_index][vehicle_id][mode]。该结构用于下一阶段
+///       ego candidate 条件化风险图，避免所有自车候选共用同一份周车风险场。
+using BehaviorConditionedMultiModalSurroundingTrajectories =
+    vec_E<MultiModalSurroundingTrajectories>;
+
 /// @class SscPlannerMapItf
 /// @brief SSC 规划器地图接口 —— 所有环境数据提供者的抽象基类
 ///
@@ -75,6 +82,14 @@ class SscPlannerMapItf {
   /// @brief 获取地图数据的时间戳
   /// @return 时间戳（秒）
   virtual decimal_t GetTimeStamp() = 0;
+
+  /// @brief 配置多模态周车预测的时间参数
+  /// @param prediction_time 多模态预测时长，单位 s
+  /// @param prediction_step 多模态预测采样间隔，单位 s
+  /// @note 默认空实现用于兼容 mock 或其他地图接口实现；SscPlannerAdapter 会使用
+  ///       该配置生成 LK/LCL/LCR 旁路轨迹，避免预测 horizon 与 SSC map horizon 脱节。
+  virtual void ConfigureMultiModalPrediction(const decimal_t prediction_time,
+                                             const decimal_t prediction_step) {}
 
   // =========================================================================
   // 自车信息
@@ -152,6 +167,17 @@ class SscPlannerMapItf {
   /// @note MVP-3 只让 risk grid 消费该旁路，不改变 binary map/corridor/QP。
   virtual ErrorType GetMultiModalSurroundingTrajectories(
       MultiModalSurroundingTrajectories* multimodal_trajs) = 0;
+
+  /// @brief 获取按自车候选行为条件化的周围车辆多模态预测轨迹
+  /// @param multimodal_trajs_by_ego_behavior 输出:
+  ///        [ego_behavior_index][vehicle_id][mode] 的多模态周车轨迹
+  /// @note 默认返回 kWrongStatus，旧 mock 或旧地图接口无需立即实现；
+  ///       SscPlanner 会自动回退到 GetMultiModalSurroundingTrajectories()。
+  virtual ErrorType GetBehaviorConditionedMultiModalSurroundingTrajectories(
+      BehaviorConditionedMultiModalSurroundingTrajectories*
+          multimodal_trajs_by_ego_behavior) {
+    return kWrongStatus;
+  }
 };
 
 }  // namespace planning

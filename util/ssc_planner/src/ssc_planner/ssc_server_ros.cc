@@ -193,7 +193,8 @@ ErrorType SscPlannerServer::FilterSingularityState(
   decimal_t max_steer = M_PI / 4.0;   // 最大转向角 (45度)
   decimal_t singular_velocity = kBigEPS;  // 判定为"静止"的速度阈值
   // 在奇异速度下允许的最大航向变化率
-  decimal_t max_orientation_rate = tan(max_steer) / 2.85 * singular_velocity;
+  decimal_t max_orientation_rate =
+      tan(max_steer) / wheel_base * singular_velocity;
   // 在当前时间间隔内允许的最大航向变化量
   decimal_t max_orientation_change = max_orientation_rate * duration;
 
@@ -218,7 +219,12 @@ ErrorType SscPlannerServer::FilterSingularityState(
 ///   2. 获取 use_sim_state 参数
 ///   3. 创建 ROS 发布者: ctrl_signal, ssc_map, executing_traj_vis
 void SscPlannerServer::Init(const std::string& config_path) {
-  planner_.Init(config_path);
+  planner_initialized_ = planner_.Init(config_path) == kSuccess;
+  if (!planner_initialized_) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to initialize SSC planner with config: %s",
+                 config_path.c_str());
+    return;
+  }
 
   // 构造各 agent 的专属话题名称
   std::string traj_topic = std::string("/vis/agent_") +
@@ -239,10 +245,18 @@ void SscPlannerServer::Init(const std::string& config_path) {
 /// 设置地图接口 (适配器) 后将 is_replan_on_ 置为 true,
 /// 并创建独立的 MainThread 线程以 work_rate_ 频率运行规划循环。
 void SscPlannerServer::Start() {
+  if (!planner_initialized_) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Planner server cannot start before successful Init().");
+    return;
+  }
   if (is_replan_on_) {
     return;  // 防止重复启动
   }
-  planner_.set_map_interface(&map_adapter_);
+  if (planner_.set_map_interface(&map_adapter_) != kSuccess) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to set SSC map interface.");
+    return;
+  }
   RCLCPP_INFO(node_->get_logger(), "Planner server started.");
   is_replan_on_ = true;
 
@@ -295,7 +309,10 @@ void SscPlannerServer::PlanCycleCallback() {
 
   // 更新地图适配器 (传递语义地图快照的共享指针)
   auto map_ptr = std::make_shared<semantic_map_manager::SemanticMapManager>(last_smm_);
-  map_adapter_.set_map(map_ptr);
+  if (map_adapter_.set_map(map_ptr) != kSuccess) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to update SSC map adapter.");
+    return;
+  }
 
   // 发布可视化与控制信号
   PublishData();

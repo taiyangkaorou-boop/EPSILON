@@ -78,7 +78,12 @@ class SscVisualizer {
   void VisualizeSscMap(const rclcpp::Time &stamp, const SscMap *p_ssc_map);
 
   /// @brief 可视化概率风险栅格，仅作为论文实验和 RViz 调试侧通道
-  void VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp, const SscMap *p_ssc_map);
+  /// @param risk_grid_snapshot 可选风险图快照；非空时优先显示 selected/baseline 候选快照
+  /// @param source_label 风险图来源标签，用于日志区分 selected / live-map fallback
+  void VisualizeRiskGridInSscSpace(const rclcpp::Time &stamp,
+                                   const SscMap *p_ssc_map,
+                                   const RiskGridMap3D *risk_grid_snapshot,
+                                   const std::string &source_label);
 
   /// @brief 可视化自车在 SSC 空间 (s,d,t) 中的位置和轮廓
   void VisualizeEgoVehicleInSscSpace(const rclcpp::Time &stamp, const common::FsVehicle &fs_ego_vehicle);

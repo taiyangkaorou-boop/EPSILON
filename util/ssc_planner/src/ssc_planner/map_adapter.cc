@@ -28,22 +28,45 @@
 #include "ssc_planner/map_adapter.h"
 
 #include <algorithm>
+#include <glog/logging.h>
 
 namespace planning {
 
 /// @brief 设置/更新底层地图数据
 /// @param map SemanticMapManager 的共享指针 (一个完整的环境快照)
 ErrorType SscPlannerAdapter::set_map(std::shared_ptr<IntegratedMap> map) {
+  if (!map) {
+    // 空地图快照不能标记为有效，否则后续 Get* 接口会解引用空指针。
+    map_.reset();
+    is_valid_ = false;
+    LOG(ERROR) << "[Ssc][MapAdapter] set_map received nullptr.";
+    return kWrongStatus;
+  }
   map_ = map;  // 持有环境快照
   is_valid_ = true;
   return kSuccess;
 }
 
 /// @brief 检查地图是否有效 (是否已调用 set_map)
-bool SscPlannerAdapter::IsValid() { return is_valid_; }
+bool SscPlannerAdapter::IsValid() { return is_valid_ && map_ != nullptr; }
 
 /// @brief 获取地图快照的时间戳
-decimal_t SscPlannerAdapter::GetTimeStamp() { return map_->time_stamp(); }
+decimal_t SscPlannerAdapter::GetTimeStamp() {
+  if (!IsValid()) {
+    LOG(ERROR) << "[Ssc][MapAdapter] GetTimeStamp called before valid map.";
+    return 0.0;
+  }
+  return map_->time_stamp();
+}
+
+/// @brief 配置多模态周车预测时间参数
+/// @param prediction_time 预测时长，单位 s
+/// @param prediction_step 预测采样间隔，单位 s
+void SscPlannerAdapter::ConfigureMultiModalPrediction(
+    const decimal_t prediction_time, const decimal_t prediction_step) {
+  multimodal_prediction_time_ = std::max<decimal_t>(0.2, prediction_time);
+  multimodal_prediction_step_ = std::max<decimal_t>(0.05, prediction_step);
+}
 
 /// @brief 获取自车完整信息 (状态 + 车辆物理参数)
 ErrorType SscPlannerAdapter::GetEgoVehicle(Vehicle* vehicle) {
@@ -80,6 +103,13 @@ ErrorType SscPlannerAdapter::GetForwardTrajectories(
     vec_E<vec_E<common::Vehicle>>* trajs) {
   if (!is_valid_) return kWrongStatus;
   if (map_->ego_behavior().forward_behaviors.size() < 1) return kWrongStatus;
+  if (map_->ego_behavior().forward_behaviors.size() !=
+      map_->ego_behavior().forward_trajs.size()) {
+    LOG(ERROR) << "[Ssc][MapAdapter] forward behavior/traj size mismatch: "
+               << map_->ego_behavior().forward_behaviors.size() << " vs "
+               << map_->ego_behavior().forward_trajs.size();
+    return kWrongStatus;
+  }
   *behaviors = map_->ego_behavior().forward_behaviors;
   *trajs = map_->ego_behavior().forward_trajs;
   return kSuccess;
@@ -96,6 +126,18 @@ ErrorType SscPlannerAdapter::GetForwardTrajectories(
     vec_E<std::unordered_map<int, vec_E<common::Vehicle>>>* sur_trajs) {
   if (!is_valid_) return kWrongStatus;
   if (map_->ego_behavior().forward_behaviors.size() < 1) return kWrongStatus;
+  if (map_->ego_behavior().forward_behaviors.size() !=
+          map_->ego_behavior().forward_trajs.size() ||
+      map_->ego_behavior().forward_behaviors.size() !=
+          map_->ego_behavior().surround_trajs.size()) {
+    LOG(ERROR) << "[Ssc][MapAdapter] forward data size mismatch: behaviors="
+               << map_->ego_behavior().forward_behaviors.size()
+               << " forward_trajs="
+               << map_->ego_behavior().forward_trajs.size()
+               << " surround_trajs="
+               << map_->ego_behavior().surround_trajs.size();
+    return kWrongStatus;
+  }
   *behaviors = map_->ego_behavior().forward_behaviors;
   *trajs = map_->ego_behavior().forward_trajs;
   *sur_trajs = map_->ego_behavior().surround_trajs;
@@ -150,8 +192,6 @@ ErrorType SscPlannerAdapter::GetMultiModalSurroundingTrajectories(
       common::LateralBehavior::kLaneChangeRight};
 
   constexpr decimal_t kMinModeProbability = 1.0e-6;
-  constexpr decimal_t kPredictionTime = 5.0;
-  constexpr decimal_t kPredictionStep = 0.2;
   constexpr decimal_t kBackwardLaneLength = 10.0;
 
   for (const auto& entry : semantic_vehicle_set.semantic_vehicles) {
@@ -172,7 +212,8 @@ ErrorType SscPlannerAdapter::GetMultiModalSurroundingTrajectories(
 
       common::Lane ref_lane;
       const decimal_t forward_lane_len =
-          std::max(semantic_vehicle.vehicle.state().velocity * kPredictionTime,
+          std::max(semantic_vehicle.vehicle.state().velocity *
+                       multimodal_prediction_time_,
                    50.0);
       if (map_->GetRefLaneForStateByBehavior(
               semantic_vehicle.vehicle.state(), std::vector<int>(), behavior,
@@ -183,8 +224,9 @@ ErrorType SscPlannerAdapter::GetMultiModalSurroundingTrajectories(
 
       vec_E<common::State> pred_states;
       if (map_->TrajectoryPredictionForVehicle(semantic_vehicle.vehicle,
-                                               ref_lane, kPredictionTime,
-                                               kPredictionStep,
+                                               ref_lane,
+                                               multimodal_prediction_time_,
+                                               multimodal_prediction_step_,
                                                &pred_states) != kSuccess) {
         continue;
       }
@@ -206,6 +248,106 @@ ErrorType SscPlannerAdapter::GetMultiModalSurroundingTrajectories(
       multimodal_trajs->insert({vehicle_id, modes});
     }
   }
+  return kSuccess;
+}
+
+/// @brief 获取按自车候选行为条件化的周车多模态预测轨迹
+///
+/// 实现策略：
+///   1. 先生成一份通用 LK/LCL/LCR 多模态轨迹，保留行为概率传播能力；
+///   2. 再用 ego_behavior().surround_trajs[i] 中已经按自车候选 i 生成的
+///      周车 deterministic 轨迹覆盖对应车辆的 argmax 模态；
+///   3. 这样每个自车候选行为至少拥有一份独立的周车风险输入，不再强制共用
+///      同一份全局 multimodal_trajs。
+ErrorType
+SscPlannerAdapter::GetBehaviorConditionedMultiModalSurroundingTrajectories(
+    BehaviorConditionedMultiModalSurroundingTrajectories*
+        multimodal_trajs_by_ego_behavior) {
+  if (!IsValid() || multimodal_trajs_by_ego_behavior == nullptr) {
+    return kWrongStatus;
+  }
+
+  const auto& ego_behavior = map_->ego_behavior();
+  const size_t num_behaviors = ego_behavior.forward_behaviors.size();
+  if (num_behaviors < 1 || ego_behavior.surround_trajs.size() != num_behaviors) {
+    LOG(ERROR) << "[Ssc][MapAdapter] cannot build behavior-conditioned "
+               << "multimodal risk input, behaviors=" << num_behaviors
+               << " surround_trajs=" << ego_behavior.surround_trajs.size();
+    return kWrongStatus;
+  }
+
+  MultiModalSurroundingTrajectories base_multimodal_trajs;
+  if (GetMultiModalSurroundingTrajectories(&base_multimodal_trajs) !=
+      kSuccess) {
+    base_multimodal_trajs.clear();
+  }
+
+  multimodal_trajs_by_ego_behavior->clear();
+  multimodal_trajs_by_ego_behavior->resize(num_behaviors);
+  const auto semantic_vehicle_set = map_->semantic_surrounding_vehicles();
+
+  for (size_t behavior_index = 0; behavior_index < num_behaviors;
+       ++behavior_index) {
+    (*multimodal_trajs_by_ego_behavior)[behavior_index] =
+        base_multimodal_trajs;
+
+    for (const auto& deterministic_traj :
+         ego_behavior.surround_trajs[behavior_index]) {
+      const int vehicle_id = deterministic_traj.first;
+      if (deterministic_traj.second.empty()) continue;
+
+      common::LateralBehavior deterministic_behavior =
+          common::LateralBehavior::kUndefined;
+      decimal_t deterministic_prob = 1.0;
+      const auto semantic_it =
+          semantic_vehicle_set.semantic_vehicles.find(vehicle_id);
+      if (semantic_it != semantic_vehicle_set.semantic_vehicles.end()) {
+        const auto& semantic_vehicle = semantic_it->second;
+        deterministic_behavior = semantic_vehicle.lat_behavior;
+        const auto& probs = semantic_vehicle.probs_lat_behaviors;
+        if (deterministic_behavior == common::LateralBehavior::kUndefined &&
+            probs.is_valid) {
+          decimal_t best_probability = -1.0;
+          common::LateralBehavior best_behavior =
+              common::LateralBehavior::kUndefined;
+          for (const auto& prob_entry : probs.probs) {
+            if (prob_entry.second > best_probability) {
+              best_probability = prob_entry.second;
+              best_behavior = prob_entry.first;
+            }
+          }
+          deterministic_behavior = best_behavior;
+        }
+        const auto prob_it = probs.probs.find(deterministic_behavior);
+        if (probs.is_valid && prob_it != probs.probs.end()) {
+          deterministic_prob = std::max<decimal_t>(
+              0.0, std::min<decimal_t>(1.0, prob_it->second));
+        }
+      }
+
+      SurroundingVehicleTrajectoryMode conditioned_mode;
+      conditioned_mode.vehicle_id = vehicle_id;
+      conditioned_mode.lat_behavior = deterministic_behavior;
+      conditioned_mode.probability = deterministic_prob;
+      conditioned_mode.traj = deterministic_traj.second;
+
+      auto& modes =
+          (*multimodal_trajs_by_ego_behavior)[behavior_index][vehicle_id];
+      bool replaced = false;
+      for (auto& mode : modes) {
+        if (mode.lat_behavior == conditioned_mode.lat_behavior) {
+          // 同一横向行为下优先使用按自车候选生成的 deterministic 周车轨迹。
+          mode = conditioned_mode;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        modes.emplace_back(conditioned_mode);
+      }
+    }
+  }
+
   return kSuccess;
 }
 

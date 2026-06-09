@@ -39,6 +39,9 @@ planner_cfg {
     # MVP-8: 只有低风险候选优势足够明显时才允许替换当前候选。
     safety_fallback_min_risk_reduction: 0.1
     safety_fallback_prefer_lane_keeping: true
+    # 风险图多模态周车预测时间参数。0.0 表示由 SSC map 时间域/分辨率自动推导。
+    multimodal_prediction_time: 0.0
+    multimodal_prediction_step: 0.0
 }
 
 map_cfg {

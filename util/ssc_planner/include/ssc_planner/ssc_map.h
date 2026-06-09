@@ -83,6 +83,15 @@ struct RiskGridStats {
   double sum_risk = 0.0;                         ///< 风险值总和 (double 累加避免 float 截断)
   size_t active_time_layers = 0;                 ///< 至少有一个非零栅格的时间层数
   std::vector<size_t> nonzero_cells_per_layer;   ///< 每时间层的非零栅格数 [layer_0, ... , layer_t-1]
+  size_t risk_source_vehicles = 0;                ///< 本次构图参与风险填充的周车数量
+  size_t risk_source_modes = 0;                   ///< 本次构图参与风险填充的周车模态数量
+};
+
+/// @brief 风险图输入源统计，用于 CSV 追踪每次构图实际使用了多少风险源
+/// @note 该结构只描述输入源数量，不参与风险值计算和规划决策。
+struct RiskGridSourceStats {
+  size_t vehicle_count = 0;  ///< 参与风险填图的周车数量
+  size_t mode_count = 0;     ///< 参与风险填图的轨迹/模态数量
 };
 
 /// @class SscMap
@@ -245,13 +254,18 @@ class SscMap {
   /// @param obstacle_grids       静态障碍物栅格的 Frenet 坐标列表
   /// @param traj_probs           周车轨迹存在概率表，key=车辆ID
   /// @param multimodal_trajs_fs  周车多模态 Frenet 轨迹，仅写入 risk grid
+  /// @param stamp                当前规划时间戳，用于 CSV 实验追踪
+  /// @param behavior_index       当前 ego behavior 构图索引，用于区分同一 planning cycle 内多次构图
+  /// @param behavior_name        当前 ego behavior 名称，用于论文数据可读性
   /// @return 错误码
   ErrorType ConstructSscMap(
       const std::unordered_map<int, vec_E<common::FsVehicle>>
           &sur_vehicle_trajs_fs,
       const vec_E<Vec2f> &obstacle_grids,
       const std::unordered_map<int, decimal_t> &traj_probs,
-      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs);
+      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs,
+      const decimal_t stamp = 0.0, const int behavior_index = -1,
+      const std::string &behavior_name = "unknown");
 
   /// @brief 对障碍物栅格进行车辆尺寸膨胀
   /// 根据车辆参数（长、宽、后轴到车尾距离）计算膨胀量并填充 p_3d_inflated_grid_
@@ -298,9 +312,26 @@ class SscMap {
 
   /// @brief 将风险占据栅格统计结果追加写入 CSV 文件
   /// @param stats 由 ComputeRiskGridStats() 计算得到的统计结构
+  /// @param stamp 当前规划时间戳
+  /// @param behavior_index 当前 ego behavior 构图索引
+  /// @param behavior_name 当前 ego behavior 名称
   /// @note MVP-1B: 仅用于论文实验数据记录。该函数只读取统计结果并写入
   ///       /tmp/epsilon_risk_grid_stats.csv，不修改地图、不参与 corridor/QP/control。
-  void AppendRiskGridStatsToCsv(const RiskGridStats &stats) const;
+  void AppendRiskGridStatsToCsv(const RiskGridStats &stats,
+                                const decimal_t stamp,
+                                const int behavior_index,
+                                const std::string &behavior_name) const;
+
+  /// @brief 统计本次 risk grid 填图实际使用的周车/模态数量
+  /// @param multimodal_trajs_fs 周车多模态 Frenet 轨迹集合
+  /// @param sur_vehicle_trajs_fs 原始 deterministic 周车 Frenet 轨迹集合
+  /// @param traj_probs deterministic 周车轨迹概率表
+  /// @return 风险输入源统计，供日志/CSV 追踪，不影响规划。
+  RiskGridSourceStats ComputeRiskGridSourceStats(
+      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs,
+      const std::unordered_map<int, vec_E<common::FsVehicle>>
+          &sur_vehicle_trajs_fs,
+      const std::unordered_map<int, decimal_t> &traj_probs) const;
 
   /// @brief 将高风险 cell 投影到二值占据图，使 corridor 避开高风险区域
   /// @return 被提升为 hard occupied 的风险栅格数量
@@ -425,6 +456,21 @@ class SscMap {
   ErrorType FillDynamicPartProbabilistic(
       const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs);
 
+  /// @brief 概率化填充多模态动态障碍物，并对缺失多模态的车辆做 deterministic 补齐
+  /// @param multimodal_trajs_fs 周围车辆多模态 Frenet 轨迹集合
+  /// @param sur_vehicle_trajs_fs 原始 deterministic 周车 Frenet 轨迹集合
+  /// @param traj_probs deterministic 周车轨迹概率表，缺失时保守回退 1.0
+  /// @return kSuccess
+  /// @note MVP-4/P0 修复：多模态预测可能因概率无效、车道构建失败或预测失败
+  ///       只覆盖部分车辆。若只要 multimodal_trajs_fs 非空就完全跳过
+  ///       deterministic 分支，会漏掉未生成多模态的车辆风险。该重载先写入
+  ///       多模态风险，再对缺失车辆按 deterministic 轨迹补齐风险图。
+  ErrorType FillDynamicPartProbabilistic(
+      const MultiModalSurroundingFsTrajectories &multimodal_trajs_fs,
+      const std::unordered_map<int, vec_E<common::FsVehicle>>
+          &sur_vehicle_trajs_fs,
+      const std::unordered_map<int, decimal_t> &traj_probs);
+
   /// @brief 将单条 Frenet 车辆轨迹填充到 3D 栅格
   ///
   /// 使用策略：对轨迹中每帧的车辆轮廓顶点，在对应的 s-d 平面对应的 t 层上，
@@ -469,9 +515,10 @@ class SscMap {
   /// @note mutable 允许 const 统计输出函数记录 IO 状态，不改变地图或规划语义。
   mutable bool risk_stats_csv_header_written_ = false;
 
-  /// @brief CSV 导出的规划周期计数器
-  /// @note 每次 ConstructSscMap() 完成风险统计后递增，用于关联日志和 CSV 行。
-  mutable size_t risk_stats_cycle_count_ = 0;
+  /// @brief CSV 导出的构图计数器
+  /// @note 每次 ConstructSscMap() 完成风险统计后递增；同一 planning cycle 可能
+  ///       对多个 ego behavior 多次构图，因此该字段语义是 map_build 而非 cycle。
+  mutable size_t risk_stats_map_build_count_ = 0;
 
   /// 立方体膨胀方向的禁用记录（暂未激活使用）
   std::unordered_map<int, std::array<bool, 6>> inters_for_cube_;

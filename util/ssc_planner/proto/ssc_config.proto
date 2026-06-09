@@ -49,6 +49,10 @@ message SscPlannerCfg {
   optional double safety_fallback_min_risk_reduction = 24 [default = 0.1];
   // MVP-8: 是否优先使用 LaneKeeping 作为保守兜底候选。
   optional bool safety_fallback_prefer_lane_keeping = 25 [default = true];
+  // 风险图多模态周车预测时长，单位 s。<=0 时自动使用 SSC map 的时间域。
+  optional double multimodal_prediction_time = 26 [default = 0.0];
+  // 风险图多模态周车预测采样间隔，单位 s。<=0 时自动使用 SSC map 的时间分辨率。
+  optional double multimodal_prediction_step = 27 [default = 0.0];
 }
 
 message InflateSteps {
