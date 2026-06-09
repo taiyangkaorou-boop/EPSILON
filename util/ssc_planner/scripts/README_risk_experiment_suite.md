@@ -161,6 +161,9 @@ python3 util/ssc_planner/scripts/risk_experiment_scenario_suite.py \
 ```text
 highway_v1.0
 highway_lite
+risk_dense_following_v1.0
+risk_merge_pressure_v1.0
+risk_lane_change_conflict_v1.0
 ring_small_v1.0
 ring_tiny_v1.0
 ```
@@ -172,9 +175,16 @@ scenario_suite_manifest.json
 scenario_run_plan.sh
 highway_v1.0/
 highway_lite/
+risk_dense_following_v1.0/
+risk_merge_pressure_v1.0/
+risk_lane_change_conflict_v1.0/
 ring_small_v1.0/
 ring_tiny_v1.0/
 ```
+
+其中 `risk_*` 场景来自 MVP-15。它们复用 `highway_lite` 路网和障碍物，
+只调整车辆初始位置、速度和相对密度，用于形成高风险初始交通态。
+这些场景不包含主动 cut-in 控制器，论文中应表述为“高密度/相对速度风险场景”。
 
 显式执行：
 

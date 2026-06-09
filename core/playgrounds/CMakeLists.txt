@@ -11,6 +11,9 @@ find_package(ament_cmake REQUIRED)
 install(DIRECTORY 
   highway_lite 
   highway_v1.0 
+  risk_dense_following_v1.0
+  risk_lane_change_conflict_v1.0
+  risk_merge_pressure_v1.0
   ring_small_v1.0 
   ring_tiny_v1.0 
   DESTINATION share/${PROJECT_NAME})
@@ -21,6 +24,15 @@ install(DIRECTORY data/
   FILES_MATCHING PATTERN "*.json" PATTERN "*.xml"
 )
 
-install(DIRECTORY highway_lite highway_v1.0 ring_small_v1.0 ring_tiny_v1.0 DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY
+  highway_lite
+  highway_v1.0
+  risk_dense_following_v1.0
+  risk_lane_change_conflict_v1.0
+  risk_merge_pressure_v1.0
+  ring_small_v1.0
+  ring_tiny_v1.0
+  DESTINATION share/${PROJECT_NAME}
+)
 
 ament_package()
