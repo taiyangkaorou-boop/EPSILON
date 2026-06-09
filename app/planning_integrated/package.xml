@@ -20,6 +20,7 @@
   <depend>glog</depend>
   <depend>visualization_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>vehicle_msgs</depend>
   <depend>message_filters</depend>
   <exec_depend>ros2launch</exec_depend>
 

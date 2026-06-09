@@ -144,6 +144,14 @@ def command_context(
         if args.planner_backend == "mpdm"
         else "test_ssc_with_eudm_ros_launch.py"
     )
+    # MVP-16: playground 自带 risk_actor_script.json 时自动启用脚本化周车。
+    default_script_path = (
+        args.repo_root / "core" / "playgrounds" / args.playground / "risk_actor_script.json"
+    )
+    risk_actor_script_path = args.risk_actor_script_path or default_script_path
+    enable_scripted_risk_actors = (
+        args.enable_scripted_risk_actors or risk_actor_script_path.exists()
+    )
     return {
         "experiment_name": experiment.name,
         "scenario_name": args.scenario_name,
@@ -157,6 +165,9 @@ def command_context(
         "risk_exposure_csv": str(args.risk_exposure_csv),
         "output_dir": str(output_dir),
         "setup_bash": str(args.setup_bash),
+        "enable_scripted_risk_actors": "true" if enable_scripted_risk_actors else "false",
+        "risk_actor_script_path": str(risk_actor_script_path),
+        "risk_actor_publish_rate_hz": str(args.risk_actor_publish_rate_hz),
     }
 
 
@@ -168,11 +179,17 @@ def default_run_command(context: Dict[str, str]) -> str:
     playground = shlex.quote(context["playground"])
     config_path = shlex.quote(context["config_path"])
     duration_sec = shlex.quote(context["duration_sec"])
+    enable_scripted_risk_actors = shlex.quote(context["enable_scripted_risk_actors"])
+    risk_actor_script_path = shlex.quote(context["risk_actor_script_path"])
+    risk_actor_publish_rate_hz = shlex.quote(context["risk_actor_publish_rate_hz"])
     return (
         f"source {setup_bash} && "
         f"timeout {duration_sec}s ros2 launch planning_integrated {launch_file} "
         f"planner_backend:={planner_backend} playground:={playground} "
-        f"ssc_config_path:={config_path}"
+        f"ssc_config_path:={config_path} "
+        f"enable_scripted_risk_actors:={enable_scripted_risk_actors} "
+        f"risk_actor_script_path:={risk_actor_script_path} "
+        f"risk_actor_publish_rate_hz:={risk_actor_publish_rate_hz}"
     )
 
 
@@ -322,6 +339,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-scripted-risk-actors",
+        action="store_true",
+        help="显式启用 MVP-16 脚本化周车；默认仅在 playground 带 risk_actor_script.json 时自动启用。",
+    )
+    parser.add_argument(
+        "--risk-actor-script-path",
+        type=Path,
+        default=None,
+        help="脚本化周车 JSON 路径；默认使用当前 playground/risk_actor_script.json。",
+    )
+    parser.add_argument(
+        "--risk-actor-publish-rate-hz",
+        type=float,
+        default=50.0,
+        help="脚本化周车控制信号发布频率。",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="真正执行每组实验命令；默认只生成 dry-run 计划。",
@@ -370,6 +404,7 @@ def main() -> int:
         args.playground = args.scenario_name
 
     repo_root = args.repo_root.resolve() if args.repo_root else repo_root_from_script()
+    args.repo_root = repo_root
     if args.setup_bash is None:
         args.setup_bash = workspace_root_from_repo(repo_root) / "install" / "setup.bash"
     if args.execute and not args.setup_bash.exists():

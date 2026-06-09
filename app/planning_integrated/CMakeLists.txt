@@ -136,6 +136,11 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  scripts/scripted_risk_actor_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 ament_package()
