@@ -231,6 +231,17 @@ class SscPlanner : public Planner {
     decimal_t applied_scale = 1.0;              ///< 权重总倍率，便于日志/CSV 追溯
   };
 
+  /// @brief MVP-8 风险兜底安全过滤结果
+  /// @note 只描述是否触发和替换候选，不直接下发 emergency control。
+  struct SafetyFallbackResult {
+    bool triggered = false;                     ///< 当前选中候选是否触发兜底阈值
+    bool switched = false;                      ///< 是否替换为更保守候选
+    int original_index = -1;                    ///< 兜底前候选索引
+    int fallback_index = -1;                    ///< 兜底后候选索引
+    decimal_t original_max_risk = 0.0;          ///< 兜底前候选最大单点风险
+    decimal_t fallback_max_risk = 0.0;          ///< 兜底候选最大单点风险
+  };
+
   /// @brief 从 protobuf 文本文件读取配置
   ErrorType ReadConfig(const std::string config_path);
 
@@ -319,7 +330,8 @@ class SscPlanner : public Planner {
   void AppendRiskExposureMetricsToCsv(
       const std::vector<RiskExposureMetrics>& metrics,
       const int baseline_index, const int selected_index,
-      const AdaptiveRiskWeightContext& risk_context) const;
+      const AdaptiveRiskWeightContext& risk_context,
+      const SafetyFallbackResult& fallback_result) const;
 
   /// @brief 判断 MVP-6 风险暴露评价是否需要启用
   /// @return true 表示需要保存 risk grid 快照并计算候选轨迹 exposure
@@ -338,6 +350,28 @@ class SscPlanner : public Planner {
   void UpdateAdaptiveRiskWeightContextByMetrics(
       const std::vector<RiskExposureMetrics>& metrics,
       AdaptiveRiskWeightContext* risk_context) const;
+
+  /// @brief 按需计算候选轨迹风险暴露
+  /// @param num_valid_behaviors 当前 QP 成功候选数量
+  /// @param risk_context 风险参数上下文
+  /// @param risk_metrics 输出：与 qp_trajs_ 对齐的风险暴露统计
+  /// @note MVP-8 需要在仅打开 safety fallback 时也能计算风险指标。
+  void EnsureRiskExposureMetrics(
+      const int num_valid_behaviors,
+      const AdaptiveRiskWeightContext& risk_context,
+      std::vector<RiskExposureMetrics>* risk_metrics) const;
+
+  /// @brief 判断是否需要计算候选风险暴露
+  /// @return true 表示 MVP-6/7 评价链路或 MVP-8 safety fallback 需要 risk metrics
+  bool ShouldComputeRiskExposureMetrics() const;
+
+  /// @brief 风险兜底安全过滤器
+  /// @param selected_index 输入/输出：当前候选索引，必要时替换为兜底候选
+  /// @param metrics 与 qp_trajs_ 对齐的风险暴露统计
+  /// @return SafetyFallbackResult 记录是否触发和是否替换
+  /// @note 默认关闭时不改变 selected_index；开启后只在已有 QP 成功候选内选择。
+  SafetyFallbackResult ApplySafetyFallbackIfNeeded(
+      int* selected_index, const std::vector<RiskExposureMetrics>& metrics) const;
 
   // =========================================================================
   // 成员变量

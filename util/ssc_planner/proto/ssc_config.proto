@@ -37,6 +37,18 @@ message SscPlannerCfg {
   optional double adaptive_max_risk_weight = 18 [default = 20.0];
   // MVP-7: 自适应后切换裕度倍率，风险高时可降低裕度让系统更愿意避险。
   optional double adaptive_switch_margin_scale = 19 [default = 0.8];
+  // MVP-8: 是否启用风险兜底安全过滤器。默认关闭，保持 MVP-7 行为。
+  optional bool enable_safety_fallback = 20 [default = false];
+  // MVP-8: 选中候选单点最大风险超过该阈值时触发保守兜底检查。
+  optional double safety_fallback_max_risk_threshold = 21 [default = 0.85];
+  // MVP-8: 选中候选总风险暴露超过该阈值时触发保守兜底检查。
+  optional double safety_fallback_exposure_sum_threshold = 22 [default = 8.0];
+  // MVP-8: 选中候选高风险采样点数量超过该阈值时触发保守兜底检查。
+  optional int32 safety_fallback_high_risk_hits_threshold = 23 [default = 5];
+  // MVP-8: 兜底候选至少需要比当前候选降低多少最大单点风险，才允许替换。
+  optional double safety_fallback_min_risk_reduction = 24 [default = 0.1];
+  // MVP-8: 是否优先使用 LaneKeeping 作为保守兜底候选。
+  optional bool safety_fallback_prefer_lane_keeping = 25 [default = true];
 }
 
 message InflateSteps {

@@ -342,9 +342,9 @@ ErrorType SscPlanner::RunOnce() {
 
   // 3b. 对每种行为: 构建地图并生成走廊
   int num_behaviors = forward_behaviors_.size();
-  const bool enable_risk_exposure_eval = IsRiskExposureEvaluationEnabled();
+  const bool need_risk_exposure_metrics = ShouldComputeRiskExposureMetrics();
   behavior_risk_grid_snapshots_.clear();
-  if (enable_risk_exposure_eval) {
+  if (need_risk_exposure_metrics) {
     behavior_risk_grid_snapshots_.reserve(static_cast<size_t>(num_behaviors));
   }
   for (int i = 0; i < num_behaviors; ++i) {
@@ -362,7 +362,7 @@ ErrorType SscPlanner::RunOnce() {
 
     // MVP-6: 每个行为的风险图在下一轮 ConstructSscMap 时会被清空重建，
     // 因此必须在当前行为构图后立即保存快照，供后续 QP 候选 exposure 使用。
-    if (enable_risk_exposure_eval) {
+    if (need_risk_exposure_metrics) {
       if (cfg_.planner_cfg().is_fitting_only()) {
         behavior_risk_grid_snapshots_.push_back(RiskGridMap3D());
       } else {
@@ -653,7 +653,7 @@ ErrorType SscPlanner::RunQpOptimization() {
     corridors_.push_back(cube_list[i]);
     ref_states_list_.push_back(ref_states);
     valid_behaviors_.push_back(forward_behaviors_[i]);
-    if (IsRiskExposureEvaluationEnabled()) {
+    if (ShouldComputeRiskExposureMetrics()) {
       if (i < static_cast<int>(behavior_risk_grid_snapshots_.size())) {
         candidate_risk_grid_snapshots_.push_back(
             behavior_risk_grid_snapshots_[static_cast<size_t>(i)]);
@@ -693,21 +693,31 @@ ErrorType SscPlanner::UpdateTrajectoryWithCurrentBehavior() {
 
   int index = baseline_index;
   std::vector<RiskExposureMetrics> risk_metrics;
-  if (IsRiskExposureEvaluationEnabled()) {
-    AdaptiveRiskWeightContext risk_context = BuildBaseAdaptiveRiskWeightContext();
-    risk_metrics.reserve(static_cast<size_t>(num_valid_behaviors));
-    for (int i = 0; i < num_valid_behaviors; ++i) {
-      risk_metrics.push_back(
-          ComputeRiskExposureForCandidate(i, risk_context.high_risk_threshold));
-    }
+  AdaptiveRiskWeightContext risk_context = BuildBaseAdaptiveRiskWeightContext();
+  SafetyFallbackResult fallback_result;
+  if (ShouldComputeRiskExposureMetrics()) {
+    EnsureRiskExposureMetrics(num_valid_behaviors, risk_context, &risk_metrics);
     UpdateAdaptiveRiskWeightContextByMetrics(risk_metrics, &risk_context);
     for (auto& metric : risk_metrics) {
       metric.risk_score = risk_context.risk_weight * metric.exposure_sum;
     }
-    index = SelectRiskAwareTrajectoryIndex(
-        baseline_index, risk_metrics, risk_context);
+    if (IsRiskExposureEvaluationEnabled()) {
+      index = SelectRiskAwareTrajectoryIndex(
+          baseline_index, risk_metrics, risk_context);
+    }
+    fallback_result = ApplySafetyFallbackIfNeeded(&index, risk_metrics);
+    if (fallback_result.triggered) {
+      LOG(WARNING) << "[Ssc][MVP8SafetyFallback] triggered=true"
+                   << " switched=" << fallback_result.switched
+                   << " original_index=" << fallback_result.original_index
+                   << " fallback_index=" << fallback_result.fallback_index
+                   << " original_max_risk="
+                   << fallback_result.original_max_risk
+                   << " fallback_max_risk="
+                   << fallback_result.fallback_max_risk;
+    }
     AppendRiskExposureMetricsToCsv(
-        risk_metrics, baseline_index, index, risk_context);
+        risk_metrics, baseline_index, index, risk_context, fallback_result);
   }
 
   // 封装最终轨迹: 高速用 Bezier, 低速用 primitive
@@ -868,7 +878,8 @@ int SscPlanner::SelectRiskAwareTrajectoryIndex(
 void SscPlanner::AppendRiskExposureMetricsToCsv(
     const std::vector<RiskExposureMetrics>& metrics,
     const int baseline_index, const int selected_index,
-    const AdaptiveRiskWeightContext& risk_context) const {
+    const AdaptiveRiskWeightContext& risk_context,
+    const SafetyFallbackResult& fallback_result) const {
   const std::string csv_path = cfg_.planner_cfg().risk_exposure_csv_path();
   if (csv_path.empty()) {
     return;
@@ -893,7 +904,10 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
                 "high_risk_hits,risk_score,adaptive_enabled,high_speed,"
                 "lane_change,high_interaction_risk,adaptive_risk_weight,"
                 "adaptive_switch_margin,adaptive_high_risk_threshold,"
-                "adaptive_max_candidate_risk,adaptive_applied_scale\n";
+                "adaptive_max_candidate_risk,adaptive_applied_scale,"
+                "safety_fallback_triggered,safety_fallback_switched,"
+                "safety_original_index,safety_fallback_index,"
+                "safety_original_max_risk,safety_fallback_max_risk\n";
     risk_exposure_csv_header_written_ = true;
   } else if (!risk_exposure_csv_header_written_) {
     // 文件已有内容时认为 header 已存在，避免重复写入表头。
@@ -921,6 +935,10 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
                  << risk_context.high_interaction_risk
                  << " adaptive_risk_weight=" << risk_context.risk_weight
                  << " adaptive_scale=" << risk_context.applied_scale
+                 << " safety_fallback_triggered="
+                 << fallback_result.triggered
+                 << " safety_fallback_switched="
+                 << fallback_result.switched
                  << " is_baseline=" << is_baseline
                  << " is_selected=" << is_selected;
 
@@ -939,7 +957,13 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
              << risk_context.switch_margin << ","
              << risk_context.high_risk_threshold << ","
              << risk_context.max_candidate_risk << ","
-             << risk_context.applied_scale << "\n";
+             << risk_context.applied_scale << ","
+             << (fallback_result.triggered ? 1 : 0) << ","
+             << (fallback_result.switched ? 1 : 0) << ","
+             << fallback_result.original_index << ","
+             << fallback_result.fallback_index << ","
+             << fallback_result.original_max_risk << ","
+             << fallback_result.fallback_max_risk << "\n";
   }
 
   if (!csv_file.good()) {
@@ -954,6 +978,126 @@ void SscPlanner::AppendRiskExposureMetricsToCsv(
 bool SscPlanner::IsRiskExposureEvaluationEnabled() const {
   return cfg_.planner_cfg().enable_risk_exposure_eval() ||
          cfg_.planner_cfg().enable_risk_exposure_reselect();
+}
+
+/// @brief 判断当前周期是否需要计算候选风险暴露
+/// @return true 表示 MVP-6/7 风险评价链路或 MVP-8 兜底过滤器需要 risk metrics
+/// @note safety fallback 默认关闭，因此不会改变 baseline/MVP-7 默认开销。
+bool SscPlanner::ShouldComputeRiskExposureMetrics() const {
+  return IsRiskExposureEvaluationEnabled() ||
+         cfg_.planner_cfg().enable_safety_fallback();
+}
+
+/// @brief 按需计算候选轨迹风险暴露
+/// @param num_valid_behaviors 当前 QP 成功候选数量
+/// @param risk_context 风险参数上下文
+/// @param risk_metrics 输出风险统计，索引与 qp_trajs_ / valid_behaviors_ 对齐
+void SscPlanner::EnsureRiskExposureMetrics(
+    const int num_valid_behaviors,
+    const AdaptiveRiskWeightContext& risk_context,
+    std::vector<RiskExposureMetrics>* risk_metrics) const {
+  if (!risk_metrics || !risk_metrics->empty()) {
+    return;
+  }
+  risk_metrics->reserve(static_cast<size_t>(std::max(0, num_valid_behaviors)));
+  for (int i = 0; i < num_valid_behaviors; ++i) {
+    risk_metrics->push_back(
+        ComputeRiskExposureForCandidate(i, risk_context.high_risk_threshold));
+  }
+}
+
+/// @brief 按风险阈值执行 MVP-8 安全兜底过滤
+/// @param selected_index 输入/输出候选索引
+/// @param metrics 候选风险暴露统计
+/// @return 兜底过滤结果
+/// @note 该函数只在已有 QP 成功候选内切换，不返回规划失败，也不直接控制制动。
+SscPlanner::SafetyFallbackResult SscPlanner::ApplySafetyFallbackIfNeeded(
+    int* selected_index, const std::vector<RiskExposureMetrics>& metrics) const {
+  SafetyFallbackResult result;
+  if (!selected_index || !cfg_.planner_cfg().enable_safety_fallback()) {
+    return result;
+  }
+
+  const int current_index = *selected_index;
+  if (current_index < 0 || current_index >= static_cast<int>(metrics.size())) {
+    return result;
+  }
+
+  const RiskExposureMetrics& selected_metric =
+      metrics[static_cast<size_t>(current_index)];
+  result.original_index = current_index;
+  result.fallback_index = current_index;
+  result.original_max_risk = selected_metric.exposure_max;
+  result.fallback_max_risk = selected_metric.exposure_max;
+
+  const decimal_t max_risk_threshold = std::max<decimal_t>(
+      0.0, cfg_.planner_cfg().safety_fallback_max_risk_threshold());
+  const decimal_t exposure_sum_threshold = std::max<decimal_t>(
+      0.0, cfg_.planner_cfg().safety_fallback_exposure_sum_threshold());
+  const int high_risk_hits_threshold =
+      std::max(0, cfg_.planner_cfg().safety_fallback_high_risk_hits_threshold());
+
+  const bool trigger_by_max_risk =
+      selected_metric.exposure_max > max_risk_threshold;
+  const bool trigger_by_sum =
+      selected_metric.exposure_sum > exposure_sum_threshold;
+  const bool trigger_by_hits =
+      static_cast<int>(selected_metric.high_risk_hits) >=
+      high_risk_hits_threshold;
+  result.triggered = trigger_by_max_risk || trigger_by_sum || trigger_by_hits;
+  if (!result.triggered) {
+    return result;
+  }
+
+  const decimal_t min_reduction = std::max<decimal_t>(
+      0.0, cfg_.planner_cfg().safety_fallback_min_risk_reduction());
+  const bool prefer_lane_keeping =
+      cfg_.planner_cfg().safety_fallback_prefer_lane_keeping();
+
+  int best_index = current_index;
+  decimal_t best_max_risk = selected_metric.exposure_max;
+  size_t best_hits = selected_metric.high_risk_hits;
+  decimal_t best_sum = selected_metric.exposure_sum;
+
+  auto consider_candidate = [&](const RiskExposureMetrics& metric) {
+    if (metric.candidate_index < 0 || metric.sample_count == 0) {
+      return;
+    }
+    if (metric.exposure_max < best_max_risk ||
+        (metric.exposure_max == best_max_risk &&
+         metric.high_risk_hits < best_hits) ||
+        (metric.exposure_max == best_max_risk &&
+         metric.high_risk_hits == best_hits &&
+         metric.exposure_sum < best_sum)) {
+      best_index = metric.candidate_index;
+      best_max_risk = metric.exposure_max;
+      best_hits = metric.high_risk_hits;
+      best_sum = metric.exposure_sum;
+    }
+  };
+
+  if (prefer_lane_keeping) {
+    for (const auto& metric : metrics) {
+      if (metric.behavior == common::LateralBehavior::kLaneKeeping) {
+        consider_candidate(metric);
+      }
+    }
+  }
+  if (best_index == current_index) {
+    for (const auto& metric : metrics) {
+      consider_candidate(metric);
+    }
+  }
+
+  result.fallback_index = best_index;
+  result.fallback_max_risk = best_max_risk;
+  if (best_index != current_index &&
+      selected_metric.exposure_max - best_max_risk >= min_reduction) {
+    *selected_index = best_index;
+    result.switched = true;
+  }
+
+  return result;
 }
 
 /// @brief 根据当前自车状态和行为构建基础自适应风险上下文

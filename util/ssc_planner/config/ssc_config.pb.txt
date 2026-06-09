@@ -30,6 +30,15 @@ planner_cfg {
     adaptive_high_risk_weight_scale: 1.4
     adaptive_max_risk_weight: 20.0
     adaptive_switch_margin_scale: 0.8
+    # MVP-8: 默认关闭风险兜底安全过滤器，保持 MVP-7 行为。
+    enable_safety_fallback: false
+    # MVP-8: 触发兜底检查的风险阈值。
+    safety_fallback_max_risk_threshold: 0.85
+    safety_fallback_exposure_sum_threshold: 8.0
+    safety_fallback_high_risk_hits_threshold: 5
+    # MVP-8: 只有低风险候选优势足够明显时才允许替换当前候选。
+    safety_fallback_min_risk_reduction: 0.1
+    safety_fallback_prefer_lane_keeping: true
 }
 
 map_cfg {
