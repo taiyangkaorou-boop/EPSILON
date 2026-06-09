@@ -19,6 +19,8 @@ SummaryRow = Dict[str, str]
 
 
 DEFAULT_METRICS = [
+    "scripted_risk_actors_enabled",
+    "scripted_risk_actor_count",
     "risk_grid_rows",
     "sum_risk_mean",
     "max_risk_max",

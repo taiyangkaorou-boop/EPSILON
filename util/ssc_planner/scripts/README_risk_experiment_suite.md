@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -168,6 +168,16 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
 
 脚本 actor 通过 `/ctrl/agent_{id}` 发布开环 `ControlSignal`，只改变实验场景中的周车运动，
 不修改 SSC、EUDM、MPDM、QP 或 phy_simulator 的车辆更新逻辑。
+
+MVP-17 会把脚本 actor 元数据写入 batch manifest、单组 summary 和 matrix 默认列：
+
+```text
+scripted_risk_actors_enabled
+scripted_risk_actor_count
+risk_actor_script_path
+```
+
+这样论文实验表格可以直接区分“普通初始态风险场景”和“主动脚本交互场景”。
 
 ## 5. 多场景实验套件
 
