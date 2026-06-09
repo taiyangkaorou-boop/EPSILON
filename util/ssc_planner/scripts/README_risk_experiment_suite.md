@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17/MVP-18/MVP-19/MVP-20 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13/MVP-14/MVP-16/MVP-17/MVP-18/MVP-19/MVP-20/MVP-21 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -350,7 +350,55 @@ verification/verification_report.csv
 
 校验失败时脚本返回非零值，适合放在论文实验流水线或 CI-like 检查中。
 
-## 9. 输出文件
+## 9. 论文图表包生成
+
+MVP-21 新增 `risk_experiment_figure_pack.py`，用于把 `matrix.csv` 转为论文图表包。
+该脚本始终输出 `plot_values.csv` 和 `figure_manifest.json`；如果本机安装了 `matplotlib`，
+还会按指标输出 PNG 横向柱状图。
+
+从单个 batch 输出目录生成图表包：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_figure_pack.py \
+  --input-root /tmp/epsilon_batch_highway_v1 \
+  --output-dir /tmp/epsilon_batch_highway_v1/figure_pack
+```
+
+从多场景 suite 输出目录生成图表包：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_figure_pack.py \
+  --input-root /tmp/epsilon_scenario_suite \
+  --output-dir /tmp/epsilon_scenario_suite/figure_pack
+```
+
+也可以显式传入多个 matrix：
+
+```bash
+python3 util/ssc_planner/scripts/risk_experiment_figure_pack.py \
+  --matrix highway=/tmp/epsilon_scenario_suite/matrix_by_scenario/highway_v1.0.csv \
+  --matrix idm=/tmp/epsilon_scenario_suite/matrix_by_scenario/risk_idm_cut_in_v1.0.csv \
+  --output-dir /tmp/epsilon_paper_figures
+```
+
+输出：
+
+```text
+plot_values.csv
+figure_manifest.json
+figures/*.png
+```
+
+推荐流程：
+
+```text
+risk_experiment_batch.py / risk_experiment_scenario_suite.py
+-> risk_experiment_verify_outputs.py
+-> risk_experiment_figure_pack.py
+-> 论文表格和图
+```
+
+## 10. 输出文件
 
 必定输出：
 
@@ -368,7 +416,7 @@ trajectory_exposure_max.png
 trajectory_risk_score.png
 ```
 
-## 10. 推荐消融实验分组
+## 11. 推荐消融实验分组
 
 ```text
 Baseline SSC
@@ -381,7 +429,7 @@ Adaptive risk weight
 Safety fallback
 ```
 
-## 11. 论文指标对应
+## 12. 论文指标对应
 
 ```text
 risk_grid.sum_risk              -> 风险图总体强度
@@ -409,7 +457,7 @@ safety_fallback_triggered_cycles -> 安全兜底触发的 planning cycle 数
 safety_fallback_switched_cycles -> 安全兜底触发并切换的 planning cycle 数
 ```
 
-## 12. 注意事项
+## 13. 注意事项
 
 脚本不参与 ROS 编译，不改变规划行为。它只读取 CSV 并写入离线报告文件，适合在每次实验运行后单独执行。
 
