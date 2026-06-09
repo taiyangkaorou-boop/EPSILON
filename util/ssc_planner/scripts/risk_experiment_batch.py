@@ -23,6 +23,7 @@ from typing import Dict, Iterable, List, Optional
 
 DEFAULT_RISK_GRID_CSV = Path("/tmp/epsilon_risk_grid_stats.csv")
 DEFAULT_RISK_EXPOSURE_CSV = Path("/tmp/epsilon_mvp6_risk_exposure.csv")
+TIMEOUT_RETURN_CODE = 124
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class ExperimentResult:
     risk_exposure_archive: str
     risk_grid_present: bool
     risk_exposure_present: bool
+    timed_out: bool
     status: str
 
 
@@ -135,7 +137,9 @@ def command_context(
     args: argparse.Namespace,
 ) -> Dict[str, str]:
     """生成命令模板可使用的占位符上下文。"""
-    launch_file = (
+    # 闭环实验默认使用 MVP-13 新增入口，同时保留后端 planning launch 占位符，方便外部模板复用。
+    launch_file = "risk_experiment_closed_loop_launch.py"
+    planning_launch_file = (
         "test_ssc_with_mpdm_ros_launch.py"
         if args.planner_backend == "mpdm"
         else "test_ssc_with_eudm_ros_launch.py"
@@ -147,6 +151,7 @@ def command_context(
         "playground": args.playground,
         "planner_backend": args.planner_backend,
         "launch_file": launch_file,
+        "planning_launch_file": planning_launch_file,
         "duration_sec": str(args.duration_sec),
         "risk_grid_csv": str(args.risk_grid_csv),
         "risk_exposure_csv": str(args.risk_exposure_csv),
@@ -156,16 +161,18 @@ def command_context(
 
 
 def default_run_command(context: Dict[str, str]) -> str:
-    """生成默认 ros2 launch 命令，适合 dry-run 展示或简单联调。"""
+    """生成默认 ros2 launch 命令，默认启动仿真器和规划器闭环。"""
     setup_bash = shlex.quote(context["setup_bash"])
     launch_file = shlex.quote(context["launch_file"])
+    planner_backend = shlex.quote(context["planner_backend"])
     playground = shlex.quote(context["playground"])
     config_path = shlex.quote(context["config_path"])
     duration_sec = shlex.quote(context["duration_sec"])
     return (
         f"source {setup_bash} && "
         f"timeout {duration_sec}s ros2 launch planning_integrated {launch_file} "
-        f"playground:={playground} ssc_config_path:={config_path}"
+        f"planner_backend:={planner_backend} playground:={playground} "
+        f"ssc_config_path:={config_path}"
     )
 
 
@@ -219,8 +226,9 @@ def write_run_plan(output_root: Path, commands: Iterable[str]) -> Path:
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "# MVP-12 dry-run 生成的实验命令计划。",
+        "# MVP-13 dry-run 生成的闭环实验命令计划。",
         "# 默认命令已包含 source install/setup.bash；自定义命令请自行保证 ROS 环境。",
+        "# 注意：默认命令由 timeout 控制实验时长，到时退出码 124 属于预期停止。",
         "",
     ]
     for command in commands:
@@ -309,7 +317,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "自定义实验运行命令模板；支持 {experiment_name}、{config_path}、"
-            "{playground}、{duration_sec}、{output_dir}、{setup_bash} 等占位符。"
+            "{playground}、{planner_backend}、{launch_file}、"
+            "{planning_launch_file}、{duration_sec}、{output_dir}、{setup_bash} 等占位符。"
         ),
     )
     parser.add_argument(
@@ -405,6 +414,7 @@ def main() -> int:
                     risk_exposure_archive=str(experiment_dir / "raw_risk_exposure.csv"),
                     risk_grid_present=False,
                     risk_exposure_present=False,
+                    timed_out=False,
                     status="dry_run",
                 )
             )
@@ -420,12 +430,14 @@ def main() -> int:
             args.risk_exposure_csv, experiment_dir / "raw_risk_exposure.csv"
         )
 
-        status = "ok" if return_code == 0 else "run_failed"
+        timed_out = return_code == TIMEOUT_RETURN_CODE
+        command_completed = return_code == 0 or timed_out
+        status = "ok" if command_completed else "run_failed"
         summary_csv = experiment_dir / "report" / "summary.csv"
-        if return_code == 0 and not risk_grid_present:
+        if command_completed and not risk_grid_present:
             status = "data_missing"
             had_error = True
-        elif return_code == 0:
+        elif command_completed:
             try:
                 summary_csv = summarize_experiment(
                     experiment, experiment_dir, args, report_script, git_reference, repo_root
@@ -448,6 +460,7 @@ def main() -> int:
                 risk_exposure_archive=str(experiment_dir / "raw_risk_exposure.csv"),
                 risk_grid_present=risk_grid_present,
                 risk_exposure_present=risk_exposure_present,
+                timed_out=timed_out,
                 status=status,
             )
         )

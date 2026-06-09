@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-该目录提供 MVP-9/MVP-11/MVP-12 实验工具，用于把规划运行时导出的 CSV
+该目录提供 MVP-9/MVP-11/MVP-12/MVP-13 实验工具，用于把规划运行时导出的 CSV
 转换为论文实验表格、趋势图和多实验消融矩阵，并支持批量编排消融实验。
 
 ## 2. 输入文件
@@ -62,15 +62,25 @@ rm -f /tmp/epsilon_risk_grid_stats.csv /tmp/epsilon_mvp6_risk_exposure.csv
 
 ## 4. 批量实验编排
 
-MVP-12 新增 `risk_experiment_batch.py`，用于固化如下流程：
+MVP-12 新增 `risk_experiment_batch.py`，MVP-13 将默认运行入口升级为闭环实验 launch，
+用于固化如下流程：
 
 ```text
 清理 /tmp CSV
--> 运行一组实验命令
+-> 启动物理仿真器 + planning_integrated 闭环
 -> 归档 raw_risk_grid_stats.csv / raw_risk_exposure.csv
 -> 调用 risk_experiment_report.py 生成 summary
 -> 所有成功组调用 risk_experiment_matrix.py 生成 matrix
 ```
+
+默认执行命令使用：
+
+```bash
+ros2 launch planning_integrated risk_experiment_closed_loop_launch.py
+```
+
+该入口会直接启动 `phy_simulator_planning_node` 和指定后端的 planning launch，
+不再依赖 joystick 节点，适合无手柄的批量实验机器。
 
 默认只生成 dry-run 计划，不启动 ROS：
 
@@ -102,6 +112,9 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
   --duration-sec 60
 ```
 
+`--duration-sec` 由 shell `timeout` 控制。实验到时退出时，`timeout` 会返回 124；
+批量脚本会把该返回码记录为 `timed_out=true`，只要 risk grid CSV 已生成，就视为该组实验有效。
+
 如果需要接入外部仿真启动脚本，可使用命令模板：
 
 ```bash
@@ -121,6 +134,7 @@ python3 util/ssc_planner/scripts/risk_experiment_batch.py \
 {playground}
 {planner_backend}
 {launch_file}
+{planning_launch_file}
 {duration_sec}
 {risk_grid_csv}
 {risk_exposure_csv}
